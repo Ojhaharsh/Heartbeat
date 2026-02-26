@@ -1,0 +1,107 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Heartbeat | Native Kokoro TTS</title>
+    <link rel="stylesheet" href="style.css">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600&family=Space+Grotesk:wght@300;500;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <div class="background-beams"></div>
+    
+    <main class="app-container">
+        <header class="glass-header">
+            <div class="logo">
+                <span class="heart-icon">❤️</span>
+                <h1 class="glow-text">HEARTBEAT</h1>
+            </div>
+            <p class="subtitle">Native Kokoro-82M TTS Engine</p>
+        </header>
+
+        <section class="main-interface glass-card">
+            <div class="sidebar voice-selection">
+                <h3>VOICE</h3>
+                <div class="voice-grid">
+                    <button class="voice-item active" data-voice="af">
+                        <div class="avatar"><img src="https://api.dicebear.com/7.x/avataaars/svg?seed=af" alt="AF"></div>
+                        <span>AF</span>
+                        <div class="play-indicator"></div>
+                    </button>
+                    <button class="voice-item" data-voice="am">
+                        <div class="avatar"><img src="https://api.dicebear.com/7.x/avataaars/svg?seed=am" alt="AM"></div>
+                        <span>AM</span>
+                    </button>
+                    <button class="voice-item" data-voice="bf">
+                        <div class="avatar"><img src="https://api.dicebear.com/7.x/avataaars/svg?seed=bf" alt="BF"></div>
+                        <span>BF</span>
+                    </button>
+                    <button class="voice-item" data-voice="bm">
+                        <div class="avatar"><img src="https://api.dicebear.com/7.x/avataaars/svg?seed=bm" alt="BM"></div>
+                        <span>BM</span>
+                    </button>
+                    <button class="voice-item" data-voice="inf">
+                        <div class="avatar"><img src="https://api.dicebear.com/7.x/avataaars/svg?seed=inf" alt="INF"></div>
+                        <span>INF</span>
+                    </button>
+                    <button class="voice-item" data-voice="inm">
+                        <div class="avatar"><img src="https://api.dicebear.com/7.x/avataaars/svg?seed=inm" alt="INM"></div>
+                        <span>INM</span>
+                    </button>
+                </div>
+            </div>
+
+            <div class="center-stage">
+                <div class="waveform-container">
+                    <canvas id="waveform"></canvas>
+                    <div class="pulse-line"></div>
+                </div>
+                
+                <div class="input-area">
+                    <textarea id="tts-input" placeholder="Type something to hear it pulse..."></textarea>
+                    <button id="synthesize-btn" class="glow-btn">
+                        <span class="btn-text">SYNTHESIZE</span>
+                        <div class="btn-glow"></div>
+                    </button>
+                </div>
+            </div>
+
+            <div class="sidebar controls">
+                <div class="control-group">
+                    <label>SPEED</label>
+                    <input type="range" min="0.5" max="2.0" step="0.1" value="1.0" class="styled-slider">
+                    <span class="value">1.0x</span>
+                </div>
+                <div class="control-group">
+                    <label>PITCH</label>
+                    <input type="range" min="0.5" max="1.5" step="0.1" value="1.0" class="styled-slider">
+                    <span class="value">1.0x</span>
+                </div>
+                
+                <div class="stats-glass">
+                    <div class="stat">
+                        <span class="label">RTF</span>
+                        <span class="val">1.2x</span>
+                    </div>
+                    <div class="stat">
+                        <span class="label">MEMORY</span>
+                        <span class="val">8GB</span>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <footer class="glass-footer">
+            <p>Powered by <span>GGML</span> & <span>Kokoro-82M</span></p>
+            <div class="status-indicator">
+                <div class="status-dot online"></div>
+                <span>ENGINE READY</span>
+            </div>
+        </footer>
+    </main>
+
+    <script src="app.js"></script>
+</body>
+</html>
