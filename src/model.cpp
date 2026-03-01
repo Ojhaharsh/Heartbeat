@@ -68,11 +68,11 @@ static size_t heartbeat_ctx_size_bytes() {
 }
 
 static int heartbeat_max_token_frames() {
-    return heartbeat_parse_env_int("HEARTBEAT_MAX_TOKEN_FRAMES", 40, 1, 200);
+    return heartbeat_parse_env_int("HEARTBEAT_MAX_TOKEN_FRAMES", 20, 1, 200);
 }
 
 static int heartbeat_max_total_frames() {
-    return heartbeat_parse_env_int("HEARTBEAT_MAX_TOTAL_FRAMES", 4096, 64, 20000);
+    return heartbeat_parse_env_int("HEARTBEAT_MAX_TOTAL_FRAMES", 1024, 64, 20000);
 }
 
 Model::Model() = default;
