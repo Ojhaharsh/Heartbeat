@@ -98,26 +98,6 @@ struct LSTMBlock {
     LinearWeights linear;
 };
 
-struct PredictorWeights {
-    // Text Encoder: 3 blocks of (BiLSTM + Linear) => 6 layers total
-    std::array<LSTMBlock, 3> text_encoder; 
-    
-    // Shared LSTM for F0/N
-    LSTMWeights shared_lstm;
-    
-    // Duration
-    LSTMWeights duration_lstm;
-    LinearWeights duration_proj;
-    
-    // F0 Predictor (3 AdainResBlk1d)
-    std::array<AdainResBlk1dWeights, 3> F0;
-    LinearWeights F0_proj;
-    
-    // N Predictor (3 AdainResBlk1d)
-    std::array<AdainResBlk1dWeights, 3> N;
-    LinearWeights N_proj;
-};
-
 // ========================================
 // AdaIN (Adaptive Instance Normalization)
 // ========================================
@@ -166,6 +146,26 @@ struct AdainResBlk1dWeights {
     AdaINWeights norm2;
     WeightNormConv conv1x1; // shortcut
     WeightNormConv pool;    // for upsampling
+};
+
+struct PredictorWeights {
+    // Text Encoder: 3 blocks of (BiLSTM + Linear) => 6 layers total
+    std::array<LSTMBlock, 3> text_encoder; 
+    
+    // Shared LSTM for F0/N
+    LSTMWeights shared_lstm;
+    
+    // Duration
+    LSTMWeights duration_lstm;
+    LinearWeights duration_proj;
+    
+    // F0 Predictor (3 AdainResBlk1d)
+    std::array<AdainResBlk1dWeights, 3> F0;
+    LinearWeights F0_proj;
+    
+    // N Predictor (3 AdainResBlk1d)
+    std::array<AdainResBlk1dWeights, 3> N;
+    LinearWeights N_proj;
 };
 
 // ========================================
@@ -293,7 +293,6 @@ private:
     
     // Decoder Helpers
     ggml_tensor* build_decoder(ggml_context* ctx, ggml_tensor* en, ggml_tensor* style);
-    ggml_tensor* build_adain(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style, const AdaINWeights& w);
     
     // Reference to loader for tensor access
     GGUFLoader* loader_ = nullptr;
