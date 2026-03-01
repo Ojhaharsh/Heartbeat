@@ -17,6 +17,7 @@
 #include <stdexcept>
 #include <cstring>
 #include <iostream>
+#include <cstdlib>
 
 extern "C" {
 #include "ggml.h"
@@ -47,11 +48,15 @@ bool Model::load_weights(GGUFLoader& loader) {
     
     params_ = loader.params();
     
-    // Print available tensor names for debugging
+    const bool verbose = std::getenv("HEARTBEAT_VERBOSE") != nullptr;
+
+    // Print available tensor names for debugging (verbose mode only)
     auto tensor_names = loader.tensor_names();
-    std::cerr << "DEBUG: Available tensors: " << tensor_names.size() << "\n";
-    for (const auto& n : tensor_names) {
-        std::cerr << "TENSOR: " << n << "\n";
+    if (verbose) {
+        std::cerr << "DEBUG: Available tensors: " << tensor_names.size() << "\n";
+        for (const auto& n : tensor_names) {
+            std::cerr << "TENSOR: " << n << "\n";
+        }
     }
     
     // Store reference to loader for direct tensor access during forward pass
@@ -160,19 +165,21 @@ bool Model::load_weights(GGUFLoader& loader) {
         "bert.embeddings.word_embeddings.weight"
     });
     
-    // Debug discovery for text encoder architecture
-    std::cerr << "--- TENSOR DISCOVERY ---\n";
-    std::vector<std::string> names = loader.tensor_names();
-    for (const auto& name : names) {
-        ggml_tensor* t = loader.get_tensor(name);
-        if (name.find("text_encoder") != std::string::npos || 
-            name.find("bert") != std::string::npos ||
-            name.find("predictor") != std::string::npos ||
-            name.find("decoder") != std::string::npos) {
-            std::cerr << "Found: " << name << " [" << t->ne[0] << "," << t->ne[1] << "," << t->ne[2] << "," << t->ne[3] << "] type=" << t->type << "\n";
+    // Debug discovery for text encoder architecture (verbose mode only)
+    if (verbose) {
+        std::cerr << "--- TENSOR DISCOVERY ---\n";
+        std::vector<std::string> names = loader.tensor_names();
+        for (const auto& name : names) {
+            ggml_tensor* t = loader.get_tensor(name);
+            if (name.find("text_encoder") != std::string::npos || 
+                name.find("bert") != std::string::npos ||
+                name.find("predictor") != std::string::npos ||
+                name.find("decoder") != std::string::npos) {
+                std::cerr << "Found: " << name << " [" << t->ne[0] << "," << t->ne[1] << "," << t->ne[2] << "," << t->ne[3] << "] type=" << t->type << "\n";
+            }
         }
+        std::cerr << "------------------------\n";
     }
-    std::cerr << "------------------------\n";
 
     if (weights_.word_embeddings) {
         std::cerr << "DEBUG: Word Embeddings loaded. Dim: " << weights_.word_embeddings->ne[0] << " x " << weights_.word_embeddings->ne[1] << "\n";
@@ -370,9 +377,10 @@ bool Model::load_weights(GGUFLoader& loader) {
     // Voice Style Vectors (loaded separately)
     // ========================================
     
-    // Default style vector (128-dim)
-    default_style_.resize(128, 0.0f);
-    for (size_t i = 0; i < 128; i++) {
+    // Default style vector (use model style_dim)
+    const size_t default_style_dim = params_.style_dim > 0 ? static_cast<size_t>(params_.style_dim) : 128;
+    default_style_.resize(default_style_dim, 0.0f);
+    for (size_t i = 0; i < default_style_dim; i++) {
         default_style_[i] = (i % 2 == 0) ? 0.1f : -0.1f;
     }
     
@@ -525,7 +533,7 @@ static ggml_tensor* build_snake(ggml_context* ctx, ggml_tensor* x, ggml_tensor* 
 }
 
 static ggml_tensor* build_adain(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style, const AdaINWeights& w) {
-    if (!w.fc_weight) return x;
+    if (!x || !style || !w.fc_weight) return x;
     
     // 1. Instance Norm
     // x is [L, C, N]
@@ -544,6 +552,9 @@ static ggml_tensor* build_adain(ggml_context* ctx, ggml_tensor* x, ggml_tensor* 
     
     // Split h into gamma and beta
     int channels = (int)x->ne[1];
+    if (h->ne[0] < 2 * channels) {
+        return x;
+    }
     ggml_tensor* gamma = ggml_view_1d(ctx, h, channels, 0);
     ggml_tensor* beta = ggml_view_1d(ctx, h, channels, channels * sizeof(float));
     
@@ -610,6 +621,18 @@ static ggml_tensor* build_resbreak_istftnet(ggml_context* ctx, ggml_tensor* x, g
         x = ggml_add(ctx, x, xt);
     }
     return x;
+}
+
+static ggml_tensor* linear_forward(ggml_context* ctx, ggml_tensor* x, const LinearWeights& w) {
+    if (!x || !w.weight) {
+        return x;
+    }
+
+    ggml_tensor* y = ggml_mul_mat(ctx, w.weight, x);
+    if (w.bias) {
+        y = ggml_add(ctx, y, ggml_repeat(ctx, w.bias, y));
+    }
+    return y;
 }
 
 // ========================================
@@ -844,54 +867,6 @@ ggml_tensor* Model::build_encoder(ggml_context* ctx, ggml_tensor* hidden) {
 // Decoder Helpers (StyleTTS2 / HiFiGAN)
 // ========================================
 
-static ggml_tensor* instance_norm_1d(ggml_context* ctx, ggml_tensor* x, float eps=1e-5f) {
-    // x: [Channels, Length]. ne[0]=Channels, ne[1]=Length.
-    // Calculate mean/std across Length (dim 1).
-    // Transpose to [Length, Channels]. ne[0]=Length.
-    ggml_tensor* xt = ggml_transpose(ctx, x);
-    // Norm over ne[0] (Length)
-    xt = ggml_norm(ctx, xt, eps);
-    // Transpose back
-    return ggml_transpose(ctx, xt);
-}
-
-static ggml_tensor* build_adain(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style, const AdaINWeights& w) {
-    if (!x || !style || !w.fc_weight) return x;
-    
-    // x: [Length, Channels, Batch] from conv1d
-    // style: [StyleDim]
-    
-    // 1. Project style
-    ggml_tensor* s = ggml_mul_mat(ctx, w.fc_weight, style);
-    if (w.fc_bias) s = ggml_add(ctx, s, w.fc_bias);
-    
-    int channels = (int)x->ne[1];
-    
-    // 2. View gamma and beta [Channels]
-    // Check if s has enough elements to avoid GGML_ASSERT
-    if (s->ne[0] < 2 * channels) {
-        std::cerr << "WARNING: Style projection too small: " << s->ne[0] << " for " << channels << " channels\n";
-        return x;
-    }
-    
-    ggml_tensor* gamma = ggml_view_1d(ctx, s, channels, 0);
-    ggml_tensor* beta = ggml_view_1d(ctx, s, channels, channels * sizeof(float));
-    
-    // 3. Reshape to 2D for norm: [Length, Channels]
-    ggml_tensor* x_2d = ggml_reshape_2d(ctx, x, x->ne[0], x->ne[1]);
-    ggml_tensor* xt = ggml_norm(ctx, x_2d, 1e-5f);
-    
-    // 4. Scale and Shift
-    ggml_tensor* g_2d = ggml_reshape_2d(ctx, gamma, 1, channels);
-    ggml_tensor* b_2d = ggml_reshape_2d(ctx, beta, 1, channels);
-    
-    xt = ggml_mul(ctx, xt, ggml_repeat(ctx, g_2d, xt));
-    xt = ggml_add(ctx, xt, ggml_repeat(ctx, b_2d, xt));
-    
-    // 5. Reshape back to 3D
-    return ggml_reshape_3d(ctx, xt, x->ne[0], x->ne[1], x->ne[2]);
-}
-
 static ggml_tensor* predictor_lstm_forward(ggml_context* ctx, 
                                            ggml_tensor* x, 
                                            ggml_tensor* style_rep,
@@ -971,6 +946,7 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     
     int seq_len = static_cast<int>(tokens.size());
     std::cerr << "DEBUG: Forward pass with seq_len=" << seq_len << "\n";
+    const bool verbose = std::getenv("HEARTBEAT_VERBOSE") != nullptr;
     
     // 1. Initialize GGML context for this inference
     // Increased to 12GB for Decoder activations (high res audio)
@@ -990,28 +966,20 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     }
     
 
-    // 5. Initialize Style Tensor
-    ggml_tensor* style_tensor = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, 128); // Style dim is 256? Params says 256?
-    // Wait, export_kokoro.py line 59 says style_dim=256?
-    // My code previously used 128 in debug prints.
-    // Let's check params_.style_dim.
-    // If param is 256, I should use params_.style_dim.
-    // Input vector 'style' size?
-    
-    int style_dim = params_.style_dim > 0 ? params_.style_dim : 256;
-    if (style.size() != style_dim) {
-         // Resize or warn?
-         // For now assume input matches.
-         style_dim = static_cast<int>(style.size());
+    // 5. Initialize style tensor
+    int style_dim = params_.style_dim > 0 ? params_.style_dim : 128;
+    if (!style.empty()) {
+        style_dim = static_cast<int>(style.size());
     }
-    
-    // Resize tensor if needed (ggml_new_tensor_1d uses constant size? No, dynamic)
-    // Re-create style tensor with correct size
-    if (style_tensor->ne[0] != style_dim) {
-        style_tensor = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, style_dim);
+    if (style_dim <= 0) {
+        style_dim = 128;
     }
-    
-    std::memcpy(style_tensor->data, style.data(), style_dim * sizeof(float));
+
+    ggml_tensor* style_tensor = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, style_dim);
+    ggml_set_zero(style_tensor);
+    if (!style.empty()) {
+        std::memcpy(style_tensor->data, style.data(), static_cast<size_t>(style_dim) * sizeof(float));
+    }
     
     // 6. Build Text Encoder (ALBERT)
     std::cerr << "DEBUG: Building Embeddings...\n";
@@ -1019,7 +987,7 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     ggml_tensor* hidden = build_embeddings(ctx0, tokens); // [seq, 128 or 256]
     
     // DEBUG: Compute Embeddings
-    {
+    if (verbose) {
         std::cerr << "DEBUG: Computing Embeddings Graph...\n";
         struct ggml_cgraph* gf_1 = ggml_new_graph(ctx0);
         ggml_build_forward_expand(gf_1, hidden);
@@ -1033,7 +1001,7 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     hidden = build_encoder(ctx0, hidden); // [768, seq]
     
     // DEBUG: Compute Encoder
-    {
+    if (verbose) {
         std::cerr << "DEBUG: Computing Encoder Graph...\n";
         struct ggml_cgraph* gf_2 = ggml_new_graph(ctx0);
         ggml_build_forward_expand(gf_2, hidden);
@@ -1048,7 +1016,7 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     ggml_tensor* log_duration = build_duration_predictor(ctx0, hidden, style_tensor);
     
     // DEBUG: Compute Durations
-    {
+    if (verbose) {
         struct ggml_cgraph* gf_dur = ggml_new_graph(ctx0);
         ggml_build_forward_expand(gf_dur, log_duration);
         ggml_graph_compute_with_ctx(ctx0, gf_dur, 1);
@@ -1075,29 +1043,55 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     int total_frames = 0;
     
     float* dur_data = (float*)log_duration->data;
-    // log_duration is [1, seq].
-    // Check shape?
-    int dur_seq_len = log_duration->ne[1]; // Should match seq_len
+    // log_duration can be [bins, seq] (preferred) or [1, seq]
+    const int dur_bins = static_cast<int>(log_duration->ne[0]);
+    const int dur_tokens = static_cast<int>(log_duration->ne[1]);
+    const int token_count = std::min(seq_len, dur_tokens);
     
-    std::cerr << "DEBUG: Duration sequence length: " << dur_seq_len << "\n";
+    std::cerr << "DEBUG: Duration shape: bins=" << dur_bins << ", tokens=" << dur_tokens << "\n";
     std::cerr << "DEBUG: Duration values (log): ";
-    for (int i = 0; i < dur_seq_len && i < 10; i++) std::cerr << dur_data[i] << " ";
+    for (int i = 0; i < std::min(dur_tokens * dur_bins, 10); i++) std::cerr << dur_data[i] << " ";
     std::cerr << "...\n";
     
-    for (int i = 0; i < dur_seq_len; i++) {
-        // duration = ceil(exp(log_dur))
-        // Clamp to min 1 frame
-        float val = dur_data[i];
-        if (!std::isfinite(val)) val = 0.0f;
-        
-        float d = std::exp(val);
-        if (d < 1.0f) d = 1.0f;
-        if (d > 50.0f) d = 50.0f; // Sanity cap for single phoneme
-        
-        int d_int = static_cast<int>(std::ceil(d));
-        
+    for (int t = 0; t < token_count; t++) {
+        float d = 1.0f;
+
+        if (dur_bins > 1) {
+            // Match Kokoro reference behavior:
+            // duration = sigmoid(logits).sum(axis=-1)
+            float sum_sigmoid = 0.0f;
+            const int base = t * dur_bins;
+            for (int b = 0; b < dur_bins; b++) {
+                float v = dur_data[base + b];
+                if (!std::isfinite(v)) {
+                    v = 0.0f;
+                }
+                sum_sigmoid += 1.0f / (1.0f + std::exp(-v));
+            }
+            d = sum_sigmoid;
+        } else {
+            // Legacy scalar-log-duration fallback.
+            float v = dur_data[t];
+            if (!std::isfinite(v)) {
+                v = 0.0f;
+            }
+            d = std::exp(v);
+        }
+
+        d = std::clamp(d, 1.0f, 100.0f);
+        int d_int = static_cast<int>(std::round(d));
+        if (d_int < 1) {
+            d_int = 1;
+        }
+
         durations.push_back(d_int);
         total_frames += d_int;
+    }
+
+    // If duration output had fewer tokens than input, pad remaining with 1 frame.
+    for (int t = token_count; t < seq_len; t++) {
+        durations.push_back(1);
+        total_frames += 1;
     }
     
     // Safety cap for total frames
@@ -1132,11 +1126,12 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     // Layout: [total_frames, 512] stored as rows
     // Each row is one frame with 512 channels
     int current_frame =0;
-    for (int i = 0; i < seq_len; i++) { 
+    const int expand_tokens = std::min(seq_len, static_cast<int>(durations.size()));
+    for (int i = 0; i < expand_tokens && current_frame < total_frames; i++) { 
         int d = durations[i];
         if (d > 0) {
             float* s = src_ptr + i * hidden_dim;
-            for (int k = 0; k < d; k++) {
+            for (int k = 0; k < d && current_frame < total_frames; k++) {
                 // Copy 512 channels for this frame  
                 // GGML stores [L, C] as L rows of C elements
                 // Frame k is at offset k*512
@@ -1202,6 +1197,10 @@ static ggml_tensor* build_resblock_impl(ggml_context* ctx,
     static const int dilations[3] = {1, 3, 5};
     
     for (int j = 0; j < 3; j++) {
+        if (!w.convs1[j].weight_v || !w.convs2[j].weight_v) {
+            continue;
+        }
+
         ggml_tensor* input = x; 
         
         // 1. AdaIN 1
@@ -1227,7 +1226,7 @@ static ggml_tensor* build_resblock_impl(ggml_context* ctx,
         h = weight_norm_conv1d(ctx, h, w.convs2[j].weight_g, w.convs2[j].weight_v, w.convs2[j].bias, 1, P2, 1);
         
         // Residual Add with Alpha
-        if (w.alpha1[j]) {
+        if (w.alpha2[j]) {
              // x = alpha1 * input + alpha2 * h ? OR input + alpha * h?
              // Usually it's input + alpha * h.
              h = ggml_mul(ctx, h, ggml_repeat(ctx, w.alpha2[j], h));
@@ -1246,67 +1245,57 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx, ggml_tensor* en, ggml_tenso
     // en: [TotalFrames, Channels(512)] (from upsampling step - already correct!)
     // Just need to add batch dimension: [TotalFrames, Channels, 1]
     ggml_tensor* x = ggml_reshape_3d(ctx, en, en->ne[0], en->ne[1], 1);
-    
-    // 1. Initial Conv
-    if (weights_.decoder_conv_pre_weight_g) {
-        x = weight_norm_conv1d(ctx, x, 
-                              weights_.decoder_conv_pre_weight_g, 
-                              weights_.decoder_conv_pre_weight_v, 
-                              weights_.decoder_conv_pre_bias, 1, 3); // Kernel 7, Padding 3
-    }
-                          
-    // 2. Upsample Stages (2 stages for Kokoro)
-    int upsample_rates[2] = {10, 6}; // Derived from Discovery kernel sizes 20 and 12
-    
+
+    // Upsample stages (Kokoro generator has 2 upsample blocks)
+    static constexpr int kUpsampleRates[2] = {10, 6};
     for (int i = 0; i < 2; i++) {
-        // A. Upsample (Transposed Conv)
-        x = weight_norm_conv_transpose_1d(ctx, x, 
-                                         weights_.decoder_ups[i].weight_g,
-                                         weights_.decoder_ups[i].weight_v,
-                                         weights_.decoder_ups[i].bias,
-                                         upsample_rates[i]);
-                                         
-        // Activation
+        if (weights_.generator.ups[i].weight_v) {
+            x = weight_norm_conv_transpose_1d(
+                ctx,
+                x,
+                weights_.generator.ups[i].weight_g,
+                weights_.generator.ups[i].weight_v,
+                weights_.generator.ups[i].bias,
+                kUpsampleRates[i]
+            );
+        }
+
         x = ggml_leaky_relu(ctx, x, 0.1f, true);
-        
-        // B. Noise Res (if stage match)
-        // Kokoro has noise_res.0 and .1 corresponding to stages 0 and 1?
-        if (weights_.decoder_noise_res[i].convs1[0].weight_v) {
-            x = build_resblock_impl(ctx, x, style, weights_.decoder_noise_res[i]);
+
+        if (weights_.generator.noise_res[i].convs1[0].weight_v) {
+            x = build_resblock_impl(ctx, x, style, weights_.generator.noise_res[i]);
         }
-        
-        // C. MRF (Residual Blocks) - 3 blocks per stage
+
         ggml_tensor* mrf_sum = nullptr;
-        int mrf_start = i * 3;
-        
+        int mrf_count = 0;
+        const int mrf_start = i * 3;
         for (int j = 0; j < 3; j++) {
-            int blk_idx = mrf_start + j;
-            if (blk_idx >= 6) break;
-            
-            ggml_tensor* r_out = build_resblock_impl(ctx, x, style, weights_.decoder_resblocks[blk_idx]);
-            
-            if (mrf_sum == nullptr) {
-                mrf_sum = r_out;
-            } else {
-                mrf_sum = ggml_add(ctx, mrf_sum, r_out);
+            const int blk_idx = mrf_start + j;
+            if (blk_idx >= 6 || !weights_.generator.resblocks[blk_idx].convs1[0].weight_v) {
+                continue;
             }
+
+            ggml_tensor* r_out = build_resblock_impl(ctx, x, style, weights_.generator.resblocks[blk_idx]);
+            mrf_sum = mrf_sum ? ggml_add(ctx, mrf_sum, r_out) : r_out;
+            mrf_count++;
         }
-        if (mrf_sum) {
-            x = ggml_scale(ctx, mrf_sum, 1.0f / 3.0f);
+
+        if (mrf_sum && mrf_count > 0) {
+            x = ggml_scale(ctx, mrf_sum, 1.0f / static_cast<float>(mrf_count));
         }
     }
-    
-    // 3. Final Activation and Conv
+
+    // Final activation and post conv
     x = ggml_leaky_relu(ctx, x, 0.1f, true);
-    
-    if (weights_.decoder_conv_post_weight_v) {
+
+    if (weights_.generator.conv_post.weight_v) {
         x = weight_norm_conv1d(ctx, x,
-                               weights_.decoder_conv_post_weight_g,
-                               weights_.decoder_conv_post_weight_v,
-                               weights_.decoder_conv_post_bias, 1, 3); // Kernel 7, Padding 3
+                               weights_.generator.conv_post.weight_g,
+                               weights_.generator.conv_post.weight_v,
+                               weights_.generator.conv_post.bias, 1, 3);
     }
-                           
-    // 4. Tanh
+
+    // Output waveform range
     x = ggml_tanh(ctx, x);
     
     return x;
