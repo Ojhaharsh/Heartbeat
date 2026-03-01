@@ -86,6 +86,30 @@ else()
 endif()
 
 # ==============================================================================
+# Runtime DLL Staging (Windows)
+# ==============================================================================
+function(heartbeat_copy_runtime_dlls target_name)
+    if(NOT WIN32)
+        return()
+    endif()
+
+    if(TARGET ggml AND TARGET ggml-cpu AND TARGET ggml-base)
+        add_custom_command(TARGET ${target_name} POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:ggml>
+                $<TARGET_FILE_DIR:${target_name}>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:ggml-cpu>
+                $<TARGET_FILE_DIR:${target_name}>
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                $<TARGET_FILE:ggml-base>
+                $<TARGET_FILE_DIR:${target_name}>
+            VERBATIM
+        )
+    endif()
+endfunction()
+
+# ==============================================================================
 # Heartbeat Library
 # ==============================================================================
 set(HEARTBEAT_SOURCES
@@ -123,6 +147,7 @@ endif()
 # ==============================================================================
 add_executable(heartbeat src/main.cpp)
 target_link_libraries(heartbeat PRIVATE heartbeat_lib)
+heartbeat_copy_runtime_dlls(heartbeat)
 
 # ==============================================================================
 # Installation
