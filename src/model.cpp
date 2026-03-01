@@ -50,6 +50,31 @@ static int heartbeat_num_threads() {
     return static_cast<int>(std::clamp(hw == 0 ? 4u : hw, 1u, 64u));
 }
 
+static int heartbeat_parse_env_int(const char* name, int fallback, int min_v, int max_v) {
+    if (const char* env = std::getenv(name)) {
+        char* end = nullptr;
+        const long parsed = std::strtol(env, &end, 10);
+        if (end != env) {
+            return static_cast<int>(std::clamp(parsed, static_cast<long>(min_v), static_cast<long>(max_v)));
+        }
+    }
+    return fallback;
+}
+
+static size_t heartbeat_ctx_size_bytes() {
+    // Default to 13 GiB to avoid small overruns on medium-length prompts.
+    const int mb = heartbeat_parse_env_int("HEARTBEAT_CTX_MB", 13312, 1024, 65536);
+    return static_cast<size_t>(mb) * 1024ULL * 1024ULL;
+}
+
+static int heartbeat_max_token_frames() {
+    return heartbeat_parse_env_int("HEARTBEAT_MAX_TOKEN_FRAMES", 40, 1, 200);
+}
+
+static int heartbeat_max_total_frames() {
+    return heartbeat_parse_env_int("HEARTBEAT_MAX_TOTAL_FRAMES", 4096, 64, 20000);
+}
+
 Model::Model() = default;
 
 Model::~Model() {
@@ -991,10 +1016,12 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     }
     const int n_threads = heartbeat_num_threads();
     
-    // 1. Initialize GGML context for this inference
-    // Increased to 12GB for Decoder activations (high res audio)
-    // Audio tensors are large [1, T]. Intermediate [C, T].
-    size_t ctx_size = 12288LL * 1024 * 1024;
+    // 1. Initialize GGML context for this inference.
+    // Configurable via HEARTBEAT_CTX_MB for memory tuning.
+    size_t ctx_size = heartbeat_ctx_size_bytes();
+    if (verbose) {
+        std::cerr << "DEBUG: GGML ctx size MB=" << (ctx_size / (1024ULL * 1024ULL)) << "\n";
+    }
     
     struct ggml_init_params params = {
         .mem_size   = ctx_size,
@@ -1107,6 +1134,7 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         for (int i = 0; i < std::min(dur_tokens * dur_bins, 10); i++) std::cerr << dur_data[i] << " ";
         std::cerr << "...\n";
     }
+    const int max_token_frames = heartbeat_max_token_frames();
     
     for (int t = 0; t < token_count; t++) {
         float d = 1.0f;
@@ -1133,7 +1161,7 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
             d = std::exp(v);
         }
 
-        d = std::clamp(d, 1.0f, 100.0f);
+        d = std::clamp(d, 1.0f, static_cast<float>(max_token_frames));
         int d_int = static_cast<int>(std::round(d));
         if (d_int < 1) {
             d_int = 1;
@@ -1149,9 +1177,10 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         total_frames += 1;
     }
     
-    // Safety cap for total frames
-    if (total_frames > 24000 * 30) { // Limit to 30 seconds
-        total_frames = 24000 * 30;
+    // Safety cap for total frames (protect decoder memory usage).
+    const int max_total_frames = heartbeat_max_total_frames();
+    if (total_frames > max_total_frames) {
+        total_frames = max_total_frames;
     }
     if (total_frames <= 0) total_frames = 1;
     
@@ -1221,32 +1250,61 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         }
     }
     
-    // 12. Extract Audio
-    // audio_tensor layout is [Length, Channels=22, Batch=1]
-    // Hypothesis: 22 channels are sub-band waveforms that need to be summed
-    // This is common in multi-band vocoders (e.g., multi-band excitation)
-    int n_frames = (int)audio_tensor->ne[0];  // Length/time dimension
-    int n_channels = (int)audio_tensor->ne[1]; // Should be 22
-    
+    // 12. Extract decoder head.
+    // audio_tensor layout: [Length, Channels, Batch].
+    // For Kokoro ISTFTNet, channels should be n_fft + 2:
+    // first half = log-magnitude bins, second half = phase logits.
+    int n_frames = (int)audio_tensor->ne[0];
+    int n_channels = (int)audio_tensor->ne[1];
+    const int n_fft = params_.istft_n_fft > 0 ? params_.istft_n_fft : 16;
+    const int n_bins = n_fft / 2 + 1;
+    const int expected_channels = 2 * n_bins;
+    float* audio_data = (float*)audio_tensor->data;
+
     if (verbose) {
         std::cerr << "DEBUG: Decoder output shape: [" << n_frames << ", " << n_channels << ", " << audio_tensor->ne[2] << "]\n";
-        std::cerr << "DEBUG: Summing " << n_channels << " sub-band channels\n";
     }
-    
+
     output.n_frames = n_frames;
-    output.n_mels = 1;  // Raw audio
-    output.magnitude.resize(n_frames);
-    output.phase.resize(0);
-    
-    float* audio_data = (float*)audio_tensor->data;
-    
-    // Sum all channels to create final waveform
-    for (int i = 0; i < n_frames; i++) {
-        float sum = 0.0f;
-        for (int c = 0; c < n_channels; c++) {
-            sum += audio_data[c * n_frames + i];
+
+    if (n_channels == expected_channels) {
+        output.n_mels = n_bins;
+        output.magnitude.resize(static_cast<size_t>(n_frames) * n_bins);
+        output.phase.resize(static_cast<size_t>(n_frames) * n_bins);
+
+        if (verbose) {
+            std::cerr << "DEBUG: Interpreting decoder output as ISTFT head (bins=" << n_bins << ")\n";
         }
-        output.magnitude[i] = sum;  // Direct sum, no averaging
+
+        for (int t = 0; t < n_frames; t++) {
+            for (int f = 0; f < n_bins; f++) {
+                const float spec_logit = audio_data[f * n_frames + t];
+                const float phase_logit = audio_data[(f + n_bins) * n_frames + t];
+                const int out_idx = t * n_bins + f;
+
+                // Match reference implementation.
+                output.magnitude[out_idx] = std::exp(std::clamp(spec_logit, -20.0f, 20.0f));
+                output.phase[out_idx] = std::sin(phase_logit);
+            }
+        }
+    } else {
+        // Fallback for unexpected tensor layout.
+        if (verbose) {
+            std::cerr << "WARNING: Unexpected decoder channels=" << n_channels
+                      << " (expected " << expected_channels << "), falling back to channel sum\n";
+        }
+
+        output.n_mels = 1;
+        output.magnitude.resize(n_frames);
+        output.phase.clear();
+
+        for (int i = 0; i < n_frames; i++) {
+            float sum = 0.0f;
+            for (int c = 0; c < n_channels; c++) {
+                sum += audio_data[c * n_frames + i];
+            }
+            output.magnitude[i] = sum;
+        }
     }
     
     
@@ -1362,9 +1420,8 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx, ggml_tensor* en, ggml_tenso
                                weights_.generator.conv_post.bias, 1, 3);
     }
 
-    // Output waveform range
-    x = ggml_tanh(ctx, x);
-    
+    // Keep logits. forward() converts to magnitude/phase and runs ISTFT.
+
     return x;
 }
 
