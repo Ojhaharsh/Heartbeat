@@ -207,19 +207,22 @@ def export_kokoro(
         with open(config_file, encoding="utf-8") as f:
             config = json.load(f)
     
-    # Extract hyperparameters
-    vocab_size = config.get("vocab_size", 178)
-    hidden_size = config.get("hidden_size", 768)
-    num_layers = config.get("num_hidden_layers", 12)
-    num_heads = config.get("num_attention_heads", 12)
-    intermediate_size = config.get("intermediate_size", 3072)
-    style_dim = config.get("style_dim", 256)
-    n_mels = config.get("n_mels", 80)
-    sample_rate = config.get("sample_rate", 24000)
-    
+    # Extract hyperparameters (supports both legacy and Kokoro v1.x config layouts)
+    plbert_cfg = config.get("plbert", {})
+    istft_cfg = config.get("istftnet", config.get("gen", {}))
+
+    vocab_size = int(config.get("n_token", config.get("vocab_size", 178)))
+    hidden_size = int(plbert_cfg.get("hidden_size", config.get("hidden_size", 768)))
+    num_layers = int(plbert_cfg.get("num_hidden_layers", config.get("num_hidden_layers", 12)))
+    num_heads = int(plbert_cfg.get("num_attention_heads", config.get("num_attention_heads", 12)))
+    intermediate_size = int(plbert_cfg.get("intermediate_size", config.get("intermediate_size", 3072)))
+    style_dim = int(config.get("style_dim", 128))
+    n_mels = int(config.get("n_mels", 80))
+    sample_rate = int(config.get("sample_rate", 24000))
+
     # ISTFT parameters
-    istft_n_fft = config.get("gen", {}).get("istft_n_fft", 16)
-    istft_hop_length = config.get("gen", {}).get("istft_hop_length", 4)
+    istft_n_fft = int(istft_cfg.get("gen_istft_n_fft", istft_cfg.get("istft_n_fft", 16)))
+    istft_hop_length = int(istft_cfg.get("gen_istft_hop_size", istft_cfg.get("istft_hop_length", 4)))
     
     print(f"\n[INFO] Model Configuration:")
     print(f"   Vocab Size:    {vocab_size}")
@@ -227,6 +230,8 @@ def export_kokoro(
     print(f"   Layers:        {num_layers}")
     print(f"   Heads:         {num_heads}")
     print(f"   Style Dim:     {style_dim}")
+    print(f"   ISTFT n_fft:   {istft_n_fft}")
+    print(f"   ISTFT hop:     {istft_hop_length}")
     print(f"   Sample Rate:   {sample_rate} Hz")
     
     # Create GGUF writer
@@ -254,13 +259,35 @@ def export_kokoro(
     
     # Write vocabulary if available
     vocab_file = input_path.parent / "vocab.json"
+    tokens = None
     if vocab_file.exists():
         with open(vocab_file, encoding="utf-8") as f:
             vocab = json.load(f)
         if isinstance(vocab, dict):
-            tokens = list(vocab.keys())
+            # If vocab is token -> id map, place tokens by ID.
+            if all(isinstance(v, (int, float)) for v in vocab.values()):
+                max_id = max(int(v) for v in vocab.values()) if vocab else -1
+                token_count = max(vocab_size, max_id + 1)
+                tokens = [f"<unused_{i}>" for i in range(token_count)]
+                for token, idx in vocab.items():
+                    idx = int(idx)
+                    if 0 <= idx < token_count:
+                        tokens[idx] = str(token)
+            else:
+                tokens = [str(k) for k in vocab.keys()]
         else:
-            tokens = vocab
+            tokens = [str(t) for t in vocab]
+    elif isinstance(config.get("vocab"), dict):
+        vocab_map = config["vocab"]
+        max_id = max(int(v) for v in vocab_map.values()) if vocab_map else -1
+        token_count = max(vocab_size, max_id + 1)
+        tokens = [f"<unused_{i}>" for i in range(token_count)]
+        for token, idx in vocab_map.items():
+            idx = int(idx)
+            if 0 <= idx < token_count:
+                tokens[idx] = str(token)
+
+    if tokens:
         writer.add_token_list(tokens)
         print(f"   Added {len(tokens)} vocabulary tokens")
     
