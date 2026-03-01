@@ -6,6 +6,7 @@
 #include <stdexcept>
 #include <iostream>
 #include <utility>
+#include <cstdlib>
 
 // KissFFT integration
 #define KISS_FFT_SCALAR float
@@ -42,13 +43,14 @@ DSP::~DSP() {
 }
 
 void DSP::init_fft() {
-    std::cerr << "DEBUG DSP: init_fft called for n_fft=" << config_.n_fft << "\n";
+    const bool verbose = std::getenv("HEARTBEAT_VERBOSE") != nullptr;
+    if (verbose) std::cerr << "DEBUG DSP: init_fft called for n_fft=" << config_.n_fft << "\n";
     // Initialize inverse FFT configuration
     fft_cfg_ = kiss_fft_alloc(config_.n_fft, 1, nullptr, nullptr);  // 1 = inverse
     if (!fft_cfg_) {
-        std::cerr << "DEBUG DSP: Failed to allocate kiss_fft_cfg!\n";
+        if (verbose) std::cerr << "DEBUG DSP: Failed to allocate kiss_fft_cfg!\n";
     } else {
-        std::cerr << "DEBUG DSP: kiss_fft_cfg allocated at " << fft_cfg_ << "\n";
+        if (verbose) std::cerr << "DEBUG DSP: kiss_fft_cfg allocated at " << fft_cfg_ << "\n";
     }
 }
 
@@ -73,7 +75,9 @@ std::vector<float> DSP::hanning_window(int size) {
 void DSP::ifft(const std::complex<float>* in, std::complex<float>* out, int n) {
     // std::cerr << "DEBUG DSP: ifft called calling with n=" << n << "\n";
     if (!fft_cfg_) {
-        std::cerr << "DEBUG DSP: ifft called with null cfg!\n";
+        if (std::getenv("HEARTBEAT_VERBOSE") != nullptr) {
+            std::cerr << "DEBUG DSP: ifft called with null cfg!\n";
+        }
         return;
     }
     auto cfg = static_cast<kiss_fft_cfg>(fft_cfg_);
