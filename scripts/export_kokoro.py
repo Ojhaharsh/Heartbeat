@@ -117,6 +117,34 @@ def compute_checksum(data: bytes) -> str:
     """Compute SHA256 checksum of tensor data."""
     return hashlib.sha256(data).hexdigest()
 
+def verify_gguf_checksums(output_path: Path, expected_checksums: Dict[str, str]) -> Tuple[int, int, List[str]]:
+    """
+    Verify exported GGUF tensors against expected checksums.
+
+    Returns:
+        (matched_count, checked_count, errors)
+    """
+    reader = gguf.GGUFReader(str(output_path))
+    errors: List[str] = []
+    matched = 0
+
+    actual: Dict[str, str] = {}
+    for tensor in reader.tensors:
+        # ReaderTensor.data is a numpy memmap with the tensor payload.
+        actual[tensor.name] = compute_checksum(tensor.data.tobytes())
+
+    for name, expected in expected_checksums.items():
+        got = actual.get(name)
+        if got is None:
+            errors.append(f"Missing tensor in GGUF: {name}")
+            continue
+        if got != expected:
+            errors.append(f"Checksum mismatch for {name}: expected {expected[:12]}..., got {got[:12]}...")
+            continue
+        matched += 1
+
+    return matched, len(expected_checksums), errors
+
 
 def get_tensor_type(name: str, dtype: torch.dtype, quantize: bool = False) -> int:
     """Determine GGUF tensor type."""
@@ -358,6 +386,17 @@ def export_kokoro(
         with open(checksum_path, "w", encoding="utf-8") as f:
             json.dump(checksums, f, indent=2)
         print(f"   Checksums:   {checksum_path}")
+
+        print("[INFO] Verifying GGUF tensor checksums...")
+        matched, checked, verify_errors = verify_gguf_checksums(output_path, checksums)
+        if verify_errors:
+            print(f"[ERROR] Verification failed: {len(verify_errors)} issue(s)")
+            for err in verify_errors[:10]:
+                print(f"   - {err}")
+            if len(verify_errors) > 10:
+                print(f"   - ... and {len(verify_errors) - 10} more")
+            raise RuntimeError("GGUF verification failed; exported tensors are not bit-exact.")
+        print(f"[INFO] Verification passed: {matched}/{checked} tensors matched.")
     
     return {
         "tensor_count": tensor_count,
@@ -398,6 +437,12 @@ def main():
         action="store_true",
         default=True,
         help="Generate checksums for verification"
+    )
+    parser.add_argument(
+        "--no-verify",
+        dest="verify",
+        action="store_false",
+        help="Skip checksum generation and GGUF verification"
     )
     
     args = parser.parse_args()
