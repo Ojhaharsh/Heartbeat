@@ -29,23 +29,66 @@ std::string read_string(const uint8_t* data, size_t& offset) {
 }
 
 GGUFValue read_gguf_value(const uint8_t* data, size_t& offset, gguf::ValueType type);
+void skip_gguf_value(const uint8_t* data, size_t& offset, gguf::ValueType type);
 
 std::vector<std::string> read_string_array(const uint8_t* data, size_t& offset) {
     auto arr_type = read_value<uint32_t>(data, offset);
     uint64_t arr_len = read_value<uint64_t>(data, offset);
     
     std::vector<std::string> result;
-    result.reserve(arr_len);
-    
-    for (uint64_t i = 0; i < arr_len; i++) {
-        if (arr_type == static_cast<uint32_t>(gguf::ValueType::STRING)) {
+    if (arr_type == static_cast<uint32_t>(gguf::ValueType::STRING)) {
+        result.reserve(arr_len);
+        for (uint64_t i = 0; i < arr_len; i++) {
             result.push_back(read_string(data, offset));
-        } else {
-            // Skip non-string array elements
-            offset += 8;  // Approximate, adjust based on type
         }
+        return result;
     }
+
+    // Skip arrays we don't store in our metadata variant.
+    const auto elem_type = static_cast<gguf::ValueType>(arr_type);
+    for (uint64_t i = 0; i < arr_len; i++) {
+        skip_gguf_value(data, offset, elem_type);
+    }
+
     return result;
+}
+
+void skip_gguf_value(const uint8_t* data, size_t& offset, gguf::ValueType type) {
+    switch (type) {
+        case gguf::ValueType::UINT8:
+        case gguf::ValueType::INT8:
+        case gguf::ValueType::BOOL:
+            offset += 1;
+            break;
+        case gguf::ValueType::UINT16:
+        case gguf::ValueType::INT16:
+            offset += 2;
+            break;
+        case gguf::ValueType::UINT32:
+        case gguf::ValueType::INT32:
+        case gguf::ValueType::FLOAT32:
+            offset += 4;
+            break;
+        case gguf::ValueType::UINT64:
+        case gguf::ValueType::INT64:
+        case gguf::ValueType::FLOAT64:
+            offset += 8;
+            break;
+        case gguf::ValueType::STRING:
+            (void) read_string(data, offset);
+            break;
+        case gguf::ValueType::ARRAY: {
+            auto nested_type_raw = read_value<uint32_t>(data, offset);
+            auto nested_len = read_value<uint64_t>(data, offset);
+            const auto nested_type = static_cast<gguf::ValueType>(nested_type_raw);
+            for (uint64_t i = 0; i < nested_len; i++) {
+                skip_gguf_value(data, offset, nested_type);
+            }
+            break;
+        }
+        default:
+            throw std::runtime_error("Unknown GGUF value type while skipping");
+    }
 }
 
 GGUFValue read_gguf_value(const uint8_t* data, size_t& offset, gguf::ValueType type) {
