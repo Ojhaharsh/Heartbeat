@@ -138,14 +138,31 @@ std::vector<float> DSP::istft(const std::vector<std::complex<float>>& spectrogra
     // IFFT buffer
     std::vector<std::complex<float>> fft_in(n_fft);
     std::vector<std::complex<float>> fft_out(n_fft);
+    const int bins_per_frame = n_frames > 0 ? static_cast<int>(spectrogram.size() / n_frames) : 0;
+    const int half_bins = n_fft / 2 + 1;
     
     for (int t = 0; t < n_frames; t++) {
-        // Extract frame from spectrogram
-        for (int f = 0; f < n_fft; f++) {
-            if (f < static_cast<int>(spectrogram.size() / n_frames)) {
-                fft_in[f] = spectrogram[t * (spectrogram.size() / n_frames) + f];
-            } else {
-                fft_in[f] = std::complex<float>(0, 0);
+        std::fill(fft_in.begin(), fft_in.end(), std::complex<float>(0.0f, 0.0f));
+
+        // Reconstruct full complex spectrum from one-sided bins when possible.
+        if (bins_per_frame == half_bins) {
+            for (int f = 0; f < half_bins; f++) {
+                fft_in[f] = spectrogram[t * bins_per_frame + f];
+            }
+
+            // Hermitian symmetry for real-valued waveform.
+            const int nyquist = n_fft / 2;
+            for (int f = 1; f < nyquist; f++) {
+                fft_in[n_fft - f] = std::conj(fft_in[f]);
+            }
+            if (n_fft % 2 == 0) {
+                fft_in[nyquist] = std::complex<float>(fft_in[nyquist].real(), 0.0f);
+            }
+        } else {
+            // Fallback if input already appears full-band.
+            const int copy_bins = std::min(n_fft, bins_per_frame);
+            for (int f = 0; f < copy_bins; f++) {
+                fft_in[f] = spectrogram[t * bins_per_frame + f];
             }
         }
         
@@ -204,20 +221,27 @@ std::vector<float> DSP::overlap_add(const std::vector<std::vector<float>>& frame
 std::vector<float> DSP::normalize(const std::vector<float>& audio, float target_peak) {
     if (audio.empty()) return audio;
     
-    // Find current peak
-    float max_val = 0.0f;
+    // Use a robust peak estimate so isolated spikes don't collapse all speech to ~0.
+    std::vector<float> abs_vals;
+    abs_vals.reserve(audio.size());
     for (float sample : audio) {
-        max_val = std::max(max_val, std::abs(sample));
+        abs_vals.push_back(std::abs(sample));
     }
-    
-    if (max_val < 1e-8f) return audio;
-    
-    // Scale to target
-    float scale = target_peak / max_val;
+
+    // 99.5th percentile absolute value.
+    const size_t p_idx = static_cast<size_t>(0.995f * static_cast<float>(abs_vals.size() - 1));
+    std::nth_element(abs_vals.begin(), abs_vals.begin() + p_idx, abs_vals.end());
+    float peak = abs_vals[p_idx];
+    if (peak < 1e-8f) {
+        peak = *std::max_element(abs_vals.begin(), abs_vals.end());
+    }
+    if (peak < 1e-8f) return audio;
+
+    float scale = target_peak / peak;
     std::vector<float> result(audio.size());
     
     for (size_t i = 0; i < audio.size(); i++) {
-        result[i] = audio[i] * scale;
+        result[i] = std::clamp(audio[i] * scale, -1.0f, 1.0f);
     }
     
     return result;
