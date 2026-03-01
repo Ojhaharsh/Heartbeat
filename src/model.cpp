@@ -18,6 +18,7 @@
 #include <cstring>
 #include <iostream>
 #include <cstdlib>
+#include <thread>
 
 extern "C" {
 #include "ggml.h"
@@ -32,6 +33,23 @@ namespace heartbeat {
 static ggml_tensor* layer_norm(ggml_context* ctx, ggml_tensor* x, 
                                ggml_tensor* weight, ggml_tensor* bias);
 
+static bool heartbeat_verbose() {
+    return std::getenv("HEARTBEAT_VERBOSE") != nullptr;
+}
+
+static int heartbeat_num_threads() {
+    if (const char* env = std::getenv("HEARTBEAT_THREADS")) {
+        char* end = nullptr;
+        const long parsed = std::strtol(env, &end, 10);
+        if (end != env && parsed > 0) {
+            return static_cast<int>(std::clamp(parsed, 1L, 64L));
+        }
+    }
+
+    const unsigned hw = std::thread::hardware_concurrency();
+    return static_cast<int>(std::clamp(hw == 0 ? 4u : hw, 1u, 64u));
+}
+
 Model::Model() = default;
 
 Model::~Model() {
@@ -42,13 +60,15 @@ Model::~Model() {
 
 bool Model::load_weights(GGUFLoader& loader) {
     if (!loader.is_loaded()) {
-        std::cerr << "DEBUG: Loader not loaded\n";
+        if (heartbeat_verbose()) {
+            std::cerr << "DEBUG: Loader not loaded\n";
+        }
         return false;
     }
     
     params_ = loader.params();
     
-    const bool verbose = std::getenv("HEARTBEAT_VERBOSE") != nullptr;
+    const bool verbose = heartbeat_verbose();
 
     // Print available tensor names for debugging (verbose mode only)
     auto tensor_names = loader.tensor_names();
@@ -67,8 +87,10 @@ bool Model::load_weights(GGUFLoader& loader) {
     weights_.text_enc_proj_weight = loader.get_tensor("bert_encoder.weight");
     weights_.text_enc_proj_bias = loader.get_tensor("bert_encoder.bias");
     
-    if (weights_.text_enc_proj_weight) std::cerr << "DEBUG: SUCCESS loading text_enc_proj (bert_encoder)\n";
-    else std::cerr << "DEBUG: FAILED loading text_enc_proj (bert_encoder)\n";
+    if (verbose) {
+        if (weights_.text_enc_proj_weight) std::cerr << "DEBUG: SUCCESS loading text_enc_proj (bert_encoder)\n";
+        else std::cerr << "DEBUG: FAILED loading text_enc_proj (bert_encoder)\n";
+    }
     
     // Helper to get tensor with fallback name patterns
     
@@ -182,7 +204,9 @@ bool Model::load_weights(GGUFLoader& loader) {
     }
 
     if (weights_.word_embeddings) {
-        std::cerr << "DEBUG: Word Embeddings loaded. Dim: " << weights_.word_embeddings->ne[0] << " x " << weights_.word_embeddings->ne[1] << "\n";
+        if (verbose) {
+            std::cerr << "DEBUG: Word Embeddings loaded. Dim: " << weights_.word_embeddings->ne[0] << " x " << weights_.word_embeddings->ne[1] << "\n";
+        }
         loaded_count++;
     }
     
@@ -257,7 +281,9 @@ bool Model::load_weights(GGUFLoader& loader) {
     
     weights_.text_enc_embedding = get_tensor({"text_encoder.embedding.weight"});
     if (weights_.text_enc_embedding) {
-        std::cerr << "DEBUG: Secondary Text Encoder Embedding loaded.\n";
+        if (verbose) {
+            std::cerr << "DEBUG: Secondary Text Encoder Embedding loaded.\n";
+        }
         loaded_count++;
     }
     
@@ -277,7 +303,9 @@ bool Model::load_weights(GGUFLoader& loader) {
         weights_.text_enc_cnn[i].norm_beta = get_tensor({cnn_prefix + ".1.beta"});
         
         if (weights_.text_enc_cnn[i].conv_weight_v) {
-            std::cerr << "DEBUG: Loaded text_encoder.cnn." << i << "\n";
+            if (verbose) {
+                std::cerr << "DEBUG: Loaded text_encoder.cnn." << i << "\n";
+            }
             loaded_count += 5;
         }
     }
@@ -285,12 +313,14 @@ bool Model::load_weights(GGUFLoader& loader) {
     // LSTM weights (Secondary Encoder)
     weights_.text_enc_lstm = get_lstm("text_encoder.lstm");
     if (weights_.text_enc_lstm.weight_ih) {
-        std::cerr << "DEBUG: Loaded text_encoder.lstm\n";
+        if (verbose) {
+            std::cerr << "DEBUG: Loaded text_encoder.lstm\n";
+        }
         loaded_count += 8;
     }
     
     // Logic moved to top
-    if (weights_.text_enc_proj_weight) std::cerr << "DEBUG: Verified text_enc_proj is loaded.\n";
+    if (verbose && weights_.text_enc_proj_weight) std::cerr << "DEBUG: Verified text_enc_proj is loaded.\n";
     
     // ========================================
     // Predictor (Style / Duration / F0 / N)
@@ -384,7 +414,9 @@ bool Model::load_weights(GGUFLoader& loader) {
         default_style_[i] = (i % 2 == 0) ? 0.1f : -0.1f;
     }
     
-    std::cerr << "DEBUG: Loaded " << loaded_count << " weight tensors\n";
+    if (verbose) {
+        std::cerr << "DEBUG: Loaded " << loaded_count << " weight tensors\n";
+    }
     
     loaded_ = true;
     return true;
@@ -642,7 +674,9 @@ static ggml_tensor* linear_forward(ggml_context* ctx, ggml_tensor* x, const Line
 ggml_tensor* Model::build_embeddings(ggml_context* ctx, 
                                       const std::vector<int>& tokens) {
     int seq_len = static_cast<int>(tokens.size());
-    std::cerr << "DEBUG: build_embeddings seq_len=" << seq_len << "\n";
+    if (heartbeat_verbose()) {
+        std::cerr << "DEBUG: build_embeddings seq_len=" << seq_len << "\n";
+    }
     
     // 1. Word Embeddings
     ggml_tensor* token_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, seq_len);
@@ -835,11 +869,15 @@ static ggml_tensor* build_cnn_lstm_encoder(ggml_context* ctx,
 ggml_tensor* Model::build_encoder(ggml_context* ctx, ggml_tensor* hidden) {
     // If CNN-LSTM weights exist, use them. Otherwise fallback to ALBERT.
     if (weights_.text_enc_cnn[0].conv_weight_v) {
-        std::cerr << "DEBUG: Using CNN-LSTM Text Encoder Path\n";
+        if (heartbeat_verbose()) {
+            std::cerr << "DEBUG: Using CNN-LSTM Text Encoder Path\n";
+        }
         return build_cnn_lstm_encoder(ctx, hidden, weights_);
     }
     
-    std::cerr << "DEBUG: Using ALBERT Transformer Text Encoder Path\n";
+    if (heartbeat_verbose()) {
+        std::cerr << "DEBUG: Using ALBERT Transformer Text Encoder Path\n";
+    }
     if (weights_.bert_proj_weight) {
         hidden = ggml_mul_mat(ctx, weights_.bert_proj_weight, hidden);
         if (weights_.bert_proj_bias) {
@@ -940,13 +978,18 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     output.n_frames = 0;
     
     if (!loaded_) {
-        std::cerr << "DEBUG: Model not loaded in forward\n";
+        if (heartbeat_verbose()) {
+            std::cerr << "DEBUG: Model not loaded in forward\n";
+        }
         return output;
     }
     
     int seq_len = static_cast<int>(tokens.size());
-    std::cerr << "DEBUG: Forward pass with seq_len=" << seq_len << "\n";
-    const bool verbose = std::getenv("HEARTBEAT_VERBOSE") != nullptr;
+    const bool verbose = heartbeat_verbose();
+    if (verbose) {
+        std::cerr << "DEBUG: Forward pass with seq_len=" << seq_len << "\n";
+    }
+    const int n_threads = heartbeat_num_threads();
     
     // 1. Initialize GGML context for this inference
     // Increased to 12GB for Decoder activations (high res audio)
@@ -982,7 +1025,9 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     }
     
     // 6. Build Text Encoder (ALBERT)
-    std::cerr << "DEBUG: Building Embeddings...\n";
+    if (verbose) {
+        std::cerr << "DEBUG: Building Embeddings...\n";
+    }
     // 5. Build Embeddings
     ggml_tensor* hidden = build_embeddings(ctx0, tokens); // [seq, 128 or 256]
     
@@ -991,13 +1036,15 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         std::cerr << "DEBUG: Computing Embeddings Graph...\n";
         struct ggml_cgraph* gf_1 = ggml_new_graph(ctx0);
         ggml_build_forward_expand(gf_1, hidden);
-        ggml_graph_compute_with_ctx(ctx0, gf_1, 1);
+        ggml_graph_compute_with_ctx(ctx0, gf_1, n_threads);
         
         float* d = (float*)hidden->data;
         std::cerr << "DEBUG: Embeddings [0]=" << d[0] << " is_nan=" << std::isnan(d[0]) << "\n";
     }
 
-    std::cerr << "DEBUG: Building Encoder...\n";
+    if (verbose) {
+        std::cerr << "DEBUG: Building Encoder...\n";
+    }
     hidden = build_encoder(ctx0, hidden); // [768, seq]
     
     // DEBUG: Compute Encoder
@@ -1005,21 +1052,23 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         std::cerr << "DEBUG: Computing Encoder Graph...\n";
         struct ggml_cgraph* gf_2 = ggml_new_graph(ctx0);
         ggml_build_forward_expand(gf_2, hidden);
-        ggml_graph_compute_with_ctx(ctx0, gf_2, 1);
+        ggml_graph_compute_with_ctx(ctx0, gf_2, n_threads);
         
         float* d = (float*)hidden->data;
         std::cerr << "DEBUG: Encoder [0]=" << d[0] << " is_nan=" << std::isnan(d[0]) << "\n";
     }
     
     // 7. Predict Durations
-    std::cerr << "DEBUG: Building Duration Predictor...\n";
+    if (verbose) {
+        std::cerr << "DEBUG: Building Duration Predictor...\n";
+    }
     ggml_tensor* log_duration = build_duration_predictor(ctx0, hidden, style_tensor);
     
     // DEBUG: Compute Durations
     if (verbose) {
         struct ggml_cgraph* gf_dur = ggml_new_graph(ctx0);
         ggml_build_forward_expand(gf_dur, log_duration);
-        ggml_graph_compute_with_ctx(ctx0, gf_dur, 1);
+        ggml_graph_compute_with_ctx(ctx0, gf_dur, n_threads);
         
         float* d = (float*)log_duration->data;
         std::cerr << "DEBUG: Log Duration [0]=" << d[0] << " seq_len=" << log_duration->ne[1] << "\n";
@@ -1032,11 +1081,15 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     }
     
     // 8. Compute Graph (Part 1: Duration)
-    std::cerr << "DEBUG: Computing Duration Graph...\n";
+    if (verbose) {
+        std::cerr << "DEBUG: Computing Duration Graph...\n";
+    }
     struct ggml_cgraph* gf = ggml_new_graph(ctx0);
     ggml_build_forward_expand(gf, log_duration);
-    ggml_graph_compute_with_ctx(ctx0, gf, 1);
-    std::cerr << "DEBUG: Duration Graph Computed.\n";
+    ggml_graph_compute_with_ctx(ctx0, gf, n_threads);
+    if (verbose) {
+        std::cerr << "DEBUG: Duration Graph Computed.\n";
+    }
     
     // 9. Process Duration Output
     std::vector<int> durations;
@@ -1048,10 +1101,12 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     const int dur_tokens = static_cast<int>(log_duration->ne[1]);
     const int token_count = std::min(seq_len, dur_tokens);
     
-    std::cerr << "DEBUG: Duration shape: bins=" << dur_bins << ", tokens=" << dur_tokens << "\n";
-    std::cerr << "DEBUG: Duration values (log): ";
-    for (int i = 0; i < std::min(dur_tokens * dur_bins, 10); i++) std::cerr << dur_data[i] << " ";
-    std::cerr << "...\n";
+    if (verbose) {
+        std::cerr << "DEBUG: Duration shape: bins=" << dur_bins << ", tokens=" << dur_tokens << "\n";
+        std::cerr << "DEBUG: Duration values (log): ";
+        for (int i = 0; i < std::min(dur_tokens * dur_bins, 10); i++) std::cerr << dur_data[i] << " ";
+        std::cerr << "...\n";
+    }
     
     for (int t = 0; t < token_count; t++) {
         float d = 1.0f;
@@ -1100,7 +1155,9 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     }
     if (total_frames <= 0) total_frames = 1;
     
-    std::cerr << "DEBUG: Predicted total frames: " << total_frames << "\n";
+    if (verbose) {
+        std::cerr << "DEBUG: Predicted total frames: " << total_frames << "\n";
+    }
     
     // 9. Up-sample Hidden States (CPU Side)
     // hidden is [512, seq_len]
@@ -1109,7 +1166,9 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     // Create new tensor input for decoder
     // size [512, total_frames]
     
-    std::cerr << "DEBUG: Upsampling hidden states to " << total_frames << " frames...\n";
+    if (verbose) {
+        std::cerr << "DEBUG: Upsampling hidden states to " << total_frames << " frames...\n";
+    }
     // Create decoder input in GGML's native [Length, Channels, Batch] layout
     // ggml_new_tensor_3d args: (ctx, type, ne0, ne1, ne2)
     // For [L, C, N]: ne0=L, ne1=C, ne2=N
@@ -1144,16 +1203,22 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     }
     
     // 10. Build Decoder
-    std::cerr << "DEBUG: Building Decoder Graph...\n";
+    if (verbose) {
+        std::cerr << "DEBUG: Building Decoder Graph...\n";
+    }
     ggml_tensor* audio_tensor = build_decoder(ctx0, dec_input, style_tensor);
     
     // 11. Compute Decoder
     {
-        std::cerr << "DEBUG: Computing Decoder (High VRAM usage)...\n";
+        if (verbose) {
+            std::cerr << "DEBUG: Computing Decoder (High VRAM usage)...\n";
+        }
         struct ggml_cgraph* gf_dec = ggml_new_graph(ctx0);
         ggml_build_forward_expand(gf_dec, audio_tensor);
-        ggml_graph_compute_with_ctx(ctx0, gf_dec, 1);
-        std::cerr << "DEBUG: Decoder Graph Computed.\n";
+        ggml_graph_compute_with_ctx(ctx0, gf_dec, n_threads);
+        if (verbose) {
+            std::cerr << "DEBUG: Decoder Graph Computed.\n";
+        }
     }
     
     // 12. Extract Audio
@@ -1163,8 +1228,10 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     int n_frames = (int)audio_tensor->ne[0];  // Length/time dimension
     int n_channels = (int)audio_tensor->ne[1]; // Should be 22
     
-    std::cerr << "DEBUG: Decoder output shape: [" << n_frames << ", " << n_channels << ", " << audio_tensor->ne[2] << "]\n";
-    std::cerr << "DEBUG: Summing " << n_channels << " sub-band channels\n";
+    if (verbose) {
+        std::cerr << "DEBUG: Decoder output shape: [" << n_frames << ", " << n_channels << ", " << audio_tensor->ne[2] << "]\n";
+        std::cerr << "DEBUG: Summing " << n_channels << " sub-band channels\n";
+    }
     
     output.n_frames = n_frames;
     output.n_mels = 1;  // Raw audio
@@ -1177,7 +1244,7 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     for (int i = 0; i < n_frames; i++) {
         float sum = 0.0f;
         for (int c = 0; c < n_channels; c++) {
-            sum += audio_data[i * n_channels + c];
+            sum += audio_data[c * n_frames + i];
         }
         output.magnitude[i] = sum;  // Direct sum, no averaging
     }
