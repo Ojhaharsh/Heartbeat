@@ -7,6 +7,7 @@
 #include <chrono>
 #include <stdexcept>
 #include <iostream>
+#include <cstdlib>
 
 namespace heartbeat {
 
@@ -80,10 +81,11 @@ SynthesisResult Heartbeat::synthesize(const std::string& text,
                                        const VoiceConfig& voice) {
     SynthesisResult result;
     result.success = false;
+    const bool verbose = std::getenv("HEARTBEAT_VERBOSE") != nullptr;
     
     if (!impl_->initialized) {
         result.error_message = "Model not initialized";
-        std::cerr << "DEBUG: Model not initialized\n";
+        if (verbose) std::cerr << "DEBUG: Model not initialized\n";
         return result;
     }
     
@@ -91,43 +93,45 @@ SynthesisResult Heartbeat::synthesize(const std::string& text,
     
     try {
         // Convert text to tokens
-        std::cerr << "DEBUG: Converting text to tokens...\n";
+        if (verbose) std::cerr << "DEBUG: Converting text to tokens...\n";
         PhonemizerConfig ph_config;
         ph_config.language = voice.language;
         ph_config.rate = voice.speed;
         
         std::vector<int> tokens = impl_->phonemizer.text_to_tokens(text, ph_config);
-        std::cerr << "DEBUG: Got " << tokens.size() << " tokens\n";
+        if (verbose) std::cerr << "DEBUG: Got " << tokens.size() << " tokens\n";
         
         if (tokens.empty()) {
             result.error_message = "Failed to phonemize text";
-            std::cerr << "DEBUG: No tokens generated\n";
+            if (verbose) std::cerr << "DEBUG: No tokens generated\n";
             return result;
         }
         
         // Get style vector for voice
-        std::cerr << "DEBUG: Getting style vector for voice: " << voice.code << "\n";
+        if (verbose) std::cerr << "DEBUG: Getting style vector for voice: " << voice.code << "\n";
         std::vector<float> style = impl_->model.get_style_vector(voice.code);
-        std::cerr << "DEBUG: Style vector size: " << style.size() << "\n";
+        if (verbose) std::cerr << "DEBUG: Style vector size: " << style.size() << "\n";
         
         // Run model forward pass
-        std::cerr << "DEBUG: Running model forward pass...\n";
+        if (verbose) std::cerr << "DEBUG: Running model forward pass...\n";
         ModelOutput model_out = impl_->model.forward(tokens, style);
-        std::cerr << "DEBUG: Model output - mag size: " << model_out.magnitude.size() 
-                  << ", phase size: " << model_out.phase.size() << "\n";
+        if (verbose) {
+            std::cerr << "DEBUG: Model output - mag size: " << model_out.magnitude.size() 
+                      << ", phase size: " << model_out.phase.size() << "\n";
+        }
         
         if (model_out.magnitude.empty() || (model_out.n_mels > 1 && model_out.phase.empty())) {
             result.error_message = "Model forward pass failed: empty output";
-            std::cerr << "DEBUG: Model forward pass returned empty/invalid output\n";
+            if (verbose) std::cerr << "DEBUG: Model forward pass returned empty/invalid output\n";
             return result;
         }
         
         // Synthesize audio
         if (model_out.n_mels == 1 && model_out.phase.empty()) {
-            std::cerr << "DEBUG: Model output is raw audio, skipping ISTFT\n";
+            if (verbose) std::cerr << "DEBUG: Model output is raw audio, skipping ISTFT\n";
             result.audio = model_out.magnitude;
         } else {
-            std::cerr << "DEBUG: Running ISTFT...\n";
+            if (verbose) std::cerr << "DEBUG: Running ISTFT...\n";
             result.audio = impl_->dsp.istft(
                 model_out.magnitude,
                 model_out.phase,
@@ -135,10 +139,10 @@ SynthesisResult Heartbeat::synthesize(const std::string& text,
                 model_out.n_frames
             );
         }
-        std::cerr << "DEBUG: Audio samples: " << result.audio.size() << "\n";
+        if (verbose) std::cerr << "DEBUG: Audio samples: " << result.audio.size() << "\n";
         
         // Post-processing
-        if (result.audio.size() > 0) {
+        if (verbose && result.audio.size() > 0) {
             std::cerr << "DEBUG Samples: ";
             for (int i = 0; i < std::min((int)result.audio.size(), 10); i++) {
                 std::cerr << result.audio[i] << " ";
@@ -146,7 +150,7 @@ SynthesisResult Heartbeat::synthesize(const std::string& text,
             std::cerr << "...\n";
         }
         result.audio = impl_->dsp.normalize(result.audio, 0.95f);
-        if (result.audio.size() > 0) {
+        if (verbose && result.audio.size() > 0) {
             std::cerr << "DEBUG Normalized Samples: ";
             for (int i = 0; i < std::min((int)result.audio.size(), 10); i++) {
                 std::cerr << result.audio[i] << " ";
@@ -164,11 +168,11 @@ SynthesisResult Heartbeat::synthesize(const std::string& text,
         result.duration_seconds = static_cast<float>(result.audio.size()) / result.sample_rate;
         result.inference_time_ms = duration.count();
         result.success = true;
-        std::cerr << "DEBUG: Synthesis complete!\n";
+        if (verbose) std::cerr << "DEBUG: Synthesis complete!\n";
         
     } catch (const std::exception& e) {
         result.error_message = std::string("Synthesis error: ") + e.what();
-        std::cerr << "DEBUG: Exception: " << e.what() << "\n";
+        if (verbose) std::cerr << "DEBUG: Exception: " << e.what() << "\n";
     }
     
     return result;
