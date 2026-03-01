@@ -19,6 +19,7 @@
 #include <iostream>
 #include <cstdlib>
 #include <thread>
+#include <fstream>
 
 extern "C" {
 #include "ggml.h"
