@@ -265,7 +265,7 @@ public:
      * @param voice_code Voice identifier (e.g., "af", "in_f").
      * @return Style embedding vector.
      */
-    std::vector<float> get_style_vector(const std::string& voice_code);
+    std::vector<float> get_style_vector(const std::string& voice_code, int token_count = -1);
     
     /**
      * Check if model is ready.
@@ -302,6 +302,13 @@ private:
     
     // Style vectors per voice
     std::unordered_map<std::string, std::vector<float>> voice_styles_;
+
+    struct VoicePack {
+        int rows = 0;
+        int dim = 0;
+        std::vector<float> data; // row-major [rows, dim]
+    };
+    std::unordered_map<std::string, VoicePack> voice_packs_;
     
     // Default style vector
     std::vector<float> default_style_;
