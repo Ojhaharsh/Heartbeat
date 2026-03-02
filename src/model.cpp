@@ -426,29 +426,105 @@ bool Model::load_weights(GGUFLoader& loader) {
     weights_.generator.conv_post.bias = get_tensor({"decoder.generator.conv_post.bias"});
     
     // ========================================
-    // Voice Style Vectors (loaded separately)
+    // Voice style packs (offline-exported from .pt files)
     // ========================================
-    
-    // ========================================
-    // Voice Style Vectors (loaded separately)
-    // ========================================
-    
-    // Default style vector (use model style_dim)
-    const size_t default_style_dim = params_.style_dim > 0 ? static_cast<size_t>(params_.style_dim) : 128;
+    const size_t model_style_dim = params_.style_dim > 0 ? static_cast<size_t>(params_.style_dim) : 128;
+
+    // Kokoro voice packs are 256-dim and split:
+    // first 128 for decoder, last 128 for predictor.
+    const size_t default_style_dim = model_style_dim * 2;
     default_style_.resize(default_style_dim, 0.0f);
     for (size_t i = 0; i < default_style_dim; i++) {
         default_style_[i] = (i % 2 == 0) ? 0.1f : -0.1f;
     }
+
+    auto load_voice_pack = [&](const std::string& key, const std::string& path) -> bool {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) {
+            return false;
+        }
+
+        char magic[4] = {0, 0, 0, 0};
+        uint32_t rows = 0;
+        uint32_t dim = 0;
+        in.read(magic, 4);
+        in.read(reinterpret_cast<char*>(&rows), sizeof(rows));
+        in.read(reinterpret_cast<char*>(&dim), sizeof(dim));
+        if (!in || std::memcmp(magic, "HVPK", 4) != 0 || rows == 0 || dim == 0) {
+            return false;
+        }
+
+        VoicePack pack;
+        pack.rows = static_cast<int>(rows);
+        pack.dim = static_cast<int>(dim);
+        pack.data.resize(static_cast<size_t>(pack.rows) * static_cast<size_t>(pack.dim));
+        in.read(reinterpret_cast<char*>(pack.data.data()),
+                static_cast<std::streamsize>(pack.data.size() * sizeof(float)));
+        if (!in) {
+            return false;
+        }
+
+        voice_packs_[key] = std::move(pack);
+        return true;
+    };
+
+    int loaded_voice_packs = 0;
+    const std::vector<std::string> voice_files = {
+        "af_bella", "af_heart",
+        "am_adam", "am_michael",
+        "bf_emma", "bf_alice",
+        "bm_george", "bm_daniel",
+        "if_sara", "im_nicola",
+    };
+    for (const auto& name : voice_files) {
+        const std::string path = "models/voices/" + name + ".hvp";
+        if (load_voice_pack(name, path)) {
+            loaded_voice_packs++;
+        }
+    }
     
     if (verbose) {
         std::cerr << "DEBUG: Loaded " << loaded_count << " weight tensors\n";
+        std::cerr << "DEBUG: Loaded " << loaded_voice_packs << " voice pack file(s)\n";
+        if (loaded_voice_packs == 0) {
+            std::cerr << "DEBUG: No voice packs found (.hvp). Run scripts/export_voices.py for better quality.\n";
+        }
     }
     
     loaded_ = true;
     return true;
 }
 
-std::vector<float> Model::get_style_vector(const std::string& voice_code) {
+std::vector<float> Model::get_style_vector(const std::string& voice_code, int token_count) {
+    static const std::unordered_map<std::string, std::string> kPreferredVoice = {
+        {"af", "af_bella"},
+        {"am", "am_adam"},
+        {"bf", "bf_emma"},
+        {"bm", "bm_george"},
+        {"in_f", "if_sara"},
+        {"in_m", "im_nicola"},
+    };
+
+    std::string resolved = voice_code;
+    auto pref_it = kPreferredVoice.find(voice_code);
+    if (pref_it != kPreferredVoice.end()) {
+        resolved = pref_it->second;
+    }
+
+    auto pack_it = voice_packs_.find(resolved);
+    if (pack_it != voice_packs_.end()) {
+        const VoicePack& pack = pack_it->second;
+        int row = pack.rows / 2;
+        if (token_count > 0) {
+            row = std::clamp(token_count - 1, 0, pack.rows - 1);
+        }
+
+        const size_t start = static_cast<size_t>(row) * static_cast<size_t>(pack.dim);
+        std::vector<float> out(pack.dim);
+        std::memcpy(out.data(), pack.data.data() + start, static_cast<size_t>(pack.dim) * sizeof(float));
+        return out;
+    }
+
     auto it = voice_styles_.find(voice_code);
     if (it != voice_styles_.end()) {
         return it->second;
