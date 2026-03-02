@@ -1113,19 +1113,32 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     }
     
 
-    // 5. Initialize style tensor
+    // 5. Initialize style tensors.
+    // Kokoro voice embedding is typically 256-d:
+    // [0:style_dim] for decoder, [style_dim:2*style_dim] for predictor.
     int style_dim = params_.style_dim > 0 ? params_.style_dim : 128;
-    if (!style.empty()) {
-        style_dim = static_cast<int>(style.size());
-    }
     if (style_dim <= 0) {
         style_dim = 128;
     }
 
-    ggml_tensor* style_tensor = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, style_dim);
-    ggml_set_zero(style_tensor);
+    ggml_tensor* style_tensor_dec = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, style_dim);
+    ggml_tensor* style_tensor_pred = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, style_dim);
+    ggml_set_zero(style_tensor_dec);
+    ggml_set_zero(style_tensor_pred);
+
     if (!style.empty()) {
-        std::memcpy(style_tensor->data, style.data(), static_cast<size_t>(style_dim) * sizeof(float));
+        if (static_cast<int>(style.size()) >= 2 * style_dim) {
+            std::memcpy(style_tensor_dec->data, style.data(), static_cast<size_t>(style_dim) * sizeof(float));
+            std::memcpy(style_tensor_pred->data, style.data() + style_dim, static_cast<size_t>(style_dim) * sizeof(float));
+        } else if (static_cast<int>(style.size()) >= style_dim) {
+            std::memcpy(style_tensor_dec->data, style.data(), static_cast<size_t>(style_dim) * sizeof(float));
+            std::memcpy(style_tensor_pred->data, style.data(), static_cast<size_t>(style_dim) * sizeof(float));
+        } else {
+            // Short vector fallback: copy what exists to both tensors.
+            const size_t copy_n = style.size();
+            std::memcpy(style_tensor_dec->data, style.data(), copy_n * sizeof(float));
+            std::memcpy(style_tensor_pred->data, style.data(), copy_n * sizeof(float));
+        }
     }
     
     // 6. Build Text Encoder (ALBERT)
@@ -1166,7 +1179,7 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     if (verbose) {
         std::cerr << "DEBUG: Building Duration Predictor...\n";
     }
-    ggml_tensor* log_duration = build_duration_predictor(ctx0, hidden, style_tensor);
+    ggml_tensor* log_duration = build_duration_predictor(ctx0, hidden, style_tensor_pred);
     
     // DEBUG: Compute Durations
     if (verbose) {
@@ -1312,7 +1325,7 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     if (verbose) {
         std::cerr << "DEBUG: Building Decoder Graph...\n";
     }
-    ggml_tensor* audio_tensor = build_decoder(ctx0, dec_input, style_tensor);
+    ggml_tensor* audio_tensor = build_decoder(ctx0, dec_input, style_tensor_dec);
     
     // 11. Compute Decoder
     {
