@@ -109,7 +109,7 @@ SynthesisResult Heartbeat::synthesize(const std::string& text,
         
         // Get style vector for voice
         if (verbose) std::cerr << "DEBUG: Getting style vector for voice: " << voice.code << "\n";
-        std::vector<float> style = impl_->model.get_style_vector(voice.code);
+        std::vector<float> style = impl_->model.get_style_vector(voice.code, static_cast<int>(tokens.size()));
         if (verbose) std::cerr << "DEBUG: Style vector size: " << style.size() << "\n";
         
         // Run model forward pass
