@@ -1115,7 +1115,17 @@ static ggml_tensor* project_curve_from_channels(ggml_context* ctx,
         // Linear fallback path if exported projection is 2D.
         ggml_tensor* x2d = ggml_reshape_2d(ctx, x3d, x3d->ne[0], x3d->ne[1]); // [L, C]
         ggml_tensor* x_cf = ggml_cont(ctx, ggml_transpose(ctx, x2d));          // [C, L]
-        ggml_tensor* y2d = linear_forward(ctx, x_cf, proj);                    // [1, L] expected
+        LinearWeights proj_use = proj;
+        if (proj_use.weight->ne[0] != x_cf->ne[0]) {
+            if (proj_use.weight->ne[1] == x_cf->ne[0]) {
+                // Some exports keep linear heads as [out, in]; align to linear_forward expectation.
+                proj_use.weight = ggml_cont(ctx, ggml_transpose(ctx, proj_use.weight));
+            } else {
+                // Shape mismatch fallback.
+                return ggml_view_3d(ctx, x3d, x3d->ne[0], 1, x3d->ne[2], x3d->nb[1], x3d->nb[2], 0);
+            }
+        }
+        ggml_tensor* y2d = linear_forward(ctx, x_cf, proj_use);                // [1, L] expected
         if (y2d->ne[0] != 1) {
             y2d = ggml_view_2d(ctx, y2d, 1, y2d->ne[1], y2d->nb[1], 0);
         }
@@ -1451,7 +1461,7 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         if (verbose) {
             std::cerr << "DEBUG: Computing Decoder (High VRAM usage)...\n";
         }
-        struct ggml_cgraph* gf_dec = ggml_new_graph(ctx0);
+        struct ggml_cgraph* gf_dec = ggml_new_graph_custom(ctx0, 32768, false);
         ggml_build_forward_expand(gf_dec, audio_tensor);
         ggml_graph_compute_with_ctx(ctx0, gf_dec, n_threads);
         if (verbose) {
@@ -1705,9 +1715,8 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
         x = ggml_leaky_relu(ctx, x, 0.1f, true);
 
         if (weights_.generator.ups[i].weight_v) {
-            const int kernel = static_cast<int>(weights_.generator.ups[i].weight_v->ne[0]);
             const int stride = kUpsampleRates[i];
-            const int padding = std::max(0, (kernel - stride) / 2);
+            const int64_t in_len = x->ne[0];
             x = weight_norm_conv_transpose_1d(
                 ctx,
                 x,
@@ -1715,9 +1724,11 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
                 weights_.generator.ups[i].weight_v,
                 weights_.generator.ups[i].bias,
                 stride,
-                padding,
+                0,
                 1
             );
+            // ggml transposed-conv currently requires padding=0, so trim to stride-exact length.
+            x = crop_time_length(ctx, x, in_len * stride);
         }
 
         if (weights_.generator.noise_res[i].convs1[0].weight_v) {
