@@ -628,7 +628,9 @@ static ggml_tensor* weight_norm_conv_transpose_1d(ggml_context* ctx,
                                                 ggml_tensor* w_g,
                                                 ggml_tensor* w_v,
                                                 ggml_tensor* bias,
-                                                int stride) {
+                                                int stride,
+                                                int padding = 0,
+                                                int dilation = 1) {
     if (!x || !w_v) return x;
     
     ggml_tensor* w = apply_weight_norm(ctx, w_g, w_v);
@@ -638,7 +640,7 @@ static ggml_tensor* weight_norm_conv_transpose_1d(ggml_context* ctx,
     ggml_tensor* w_f16 = ggml_cast(ctx, w_cont, GGML_TYPE_F16);
     
     // ggml_conv_transpose_1d: kernel [K, OC, IC], data [L, IC, N]
-    ggml_tensor* h = ggml_conv_transpose_1d(ctx, w_f16, x, stride, 0, 1);
+    ggml_tensor* h = ggml_conv_transpose_1d(ctx, w_f16, x, stride, padding, dilation);
     
     if (bias) {
         h = ggml_add(ctx, h, ggml_repeat(ctx, ggml_reshape_3d(ctx, bias, 1, bias->ne[0], 1), h));
@@ -706,17 +708,34 @@ static ggml_tensor* build_adain(ggml_context* ctx, ggml_tensor* x, ggml_tensor* 
     return out;
 }
 
+static ggml_tensor* crop_time_length(ggml_context* ctx, ggml_tensor* x, int64_t target_len) {
+    if (!x || target_len <= 0 || x->ne[0] <= target_len) {
+        return x;
+    }
+    return ggml_view_3d(ctx, x, target_len, x->ne[1], x->ne[2], x->nb[1], x->nb[2], 0);
+}
+
+static ggml_tensor* upsample_nearest_2x(ggml_context* ctx, ggml_tensor* x) {
+    if (!x || ggml_n_dims(x) < 3) {
+        return x;
+    }
+    const int64_t len = x->ne[0];
+    const int64_t ch = x->ne[1];
+    const int64_t batch = x->ne[2];
+    ggml_tensor* x4 = ggml_reshape_4d(ctx, x, 1, len, ch, batch);
+    ggml_tensor* tgt = ggml_new_tensor_4d(ctx, x->type, 2, len, ch, batch);
+    ggml_tensor* rep = ggml_repeat(ctx, x4, tgt);
+    return ggml_reshape_3d(ctx, rep, len * 2, ch, batch);
+}
+
 static ggml_tensor* build_adainresblk1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style, const AdainResBlk1dWeights& w, bool upsample) {
+    const int64_t target_len = upsample ? (x->ne[0] * 2) : x->ne[0];
+
     // shortcut
     ggml_tensor* shortcut = x;
     if (upsample) {
-        // Nearest neighbor upsample (scale factor 2)
-        // Inistftnet.py: F.interpolate(x, scale_factor=2, mode='nearest')
-        // GGML doesn't have interpolate. We can use repeat or manual expansion.
-        // For simplicity, let's use a 1D trans-conv with stride 2 if pool exists.
-        if (w.pool.weight_v) {
-            shortcut = weight_norm_conv_transpose_1d(ctx, shortcut, w.pool.weight_g, w.pool.weight_v, w.pool.bias, 2);
-        }
+        shortcut = upsample_nearest_2x(ctx, shortcut);
+        shortcut = crop_time_length(ctx, shortcut, target_len);
     }
     if (w.conv1x1.weight_v) {
         shortcut = weight_norm_conv1d(ctx, shortcut, w.conv1x1.weight_g, w.conv1x1.weight_v, nullptr, 1, 0, 1);
@@ -726,8 +745,10 @@ static ggml_tensor* build_adainresblk1d(ggml_context* ctx, ggml_tensor* x, ggml_
     ggml_tensor* res = build_adain(ctx, x, style, w.norm1);
     res = ggml_leaky_relu(ctx, res, 0.2, true);
     
-    if (upsample && w.pool.weight_v) {
-        res = weight_norm_conv_transpose_1d(ctx, res, w.pool.weight_g, w.pool.weight_v, w.pool.bias, 2);
+    if (upsample) {
+        // Approximate depthwise transposed-conv with nearest upsample.
+        res = upsample_nearest_2x(ctx, res);
+        res = crop_time_length(ctx, res, target_len);
     }
     
     res = weight_norm_conv1d(ctx, res, w.conv1.weight_g, w.conv1.weight_v, w.conv1.bias, 1, 1, 1);
@@ -1072,6 +1093,72 @@ ggml_tensor* Model::build_duration_predictor(ggml_context* ctx,
     return x;
 }
 
+static ggml_tensor* project_curve_from_channels(ggml_context* ctx,
+                                                ggml_tensor* x3d,
+                                                const LinearWeights& proj) {
+    if (!x3d) {
+        return nullptr;
+    }
+
+    if (proj.weight) {
+        // Conv1d 1x1 projection path (typical for Kokoro F0/N heads).
+        if (ggml_n_dims(proj.weight) >= 3) {
+            ggml_tensor* w_cont = ggml_cont(ctx, proj.weight);
+            ggml_tensor* w_f16 = ggml_cast(ctx, w_cont, GGML_TYPE_F16);
+            ggml_tensor* y = ggml_conv_1d(ctx, w_f16, x3d, 1, 0, 1);
+            if (proj.bias) {
+                y = ggml_add(ctx, y, ggml_repeat(ctx, ggml_reshape_3d(ctx, proj.bias, 1, proj.bias->ne[0], 1), y));
+            }
+            return y;
+        }
+
+        // Linear fallback path if exported projection is 2D.
+        ggml_tensor* x2d = ggml_reshape_2d(ctx, x3d, x3d->ne[0], x3d->ne[1]); // [L, C]
+        ggml_tensor* x_cf = ggml_cont(ctx, ggml_transpose(ctx, x2d));          // [C, L]
+        ggml_tensor* y2d = linear_forward(ctx, x_cf, proj);                    // [1, L] expected
+        if (y2d->ne[0] != 1) {
+            y2d = ggml_view_2d(ctx, y2d, 1, y2d->ne[1], y2d->nb[1], 0);
+        }
+        ggml_tensor* y_lc = ggml_cont(ctx, ggml_transpose(ctx, y2d));          // [L, 1]
+        return ggml_reshape_3d(ctx, y_lc, y_lc->ne[0], y_lc->ne[1], 1);        // [L, 1, 1]
+    }
+
+    // Fallback: use first channel if projection head is unavailable.
+    return ggml_view_3d(ctx, x3d, x3d->ne[0], 1, x3d->ne[2], x3d->nb[1], x3d->nb[2], 0);
+}
+
+static ggml_tensor* build_f0n_curve_predictor(ggml_context* ctx,
+                                              ggml_tensor* en,
+                                              ggml_tensor* style,
+                                              const PredictorWeights& predictor,
+                                              const std::array<AdainResBlk1dWeights, 3>& blocks,
+                                              const LinearWeights& proj) {
+    if (!en) {
+        return nullptr;
+    }
+
+    ggml_tensor* x = en; // [C, L]
+    if (style && predictor.shared_lstm.weight_ih) {
+        const int seq_len = static_cast<int>(x->ne[1]);
+        const int style_dim = static_cast<int>(style->ne[0]);
+        ggml_tensor* style_rep = ggml_repeat(ctx, style, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, style_dim, seq_len));
+        x = predictor_lstm_forward(ctx, x, style_rep, predictor.shared_lstm);
+    }
+
+    ggml_tensor* x_lc = ggml_cont(ctx, ggml_transpose(ctx, x));              // [L, C]
+    ggml_tensor* h = ggml_reshape_3d(ctx, x_lc, x_lc->ne[0], x_lc->ne[1], 1); // [L, C, 1]
+
+    for (int i = 0; i < 3; i++) {
+        if (!blocks[i].conv1.weight_v) {
+            continue;
+        }
+        const bool upsample = (i == 1);
+        h = build_adainresblk1d(ctx, h, style, blocks[i], upsample);
+    }
+
+    return project_curve_from_channels(ctx, h, proj); // [L2, 1, 1]
+}
+
 
 ModelOutput Model::forward(const std::vector<int>& tokens,
                             const std::vector<float>& style) {
@@ -1321,13 +1408,45 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         }
     }
     
-    // 10. Build Decoder
+    // 10. Build F0/N predictor curves from aligned encoder frames.
+    ggml_tensor* en_aligned = ggml_cont(ctx0, ggml_transpose(ctx0, dec_input)); // [512, T]
+    ggml_tensor* f0_curve = build_f0n_curve_predictor(
+        ctx0,
+        en_aligned,
+        style_tensor_pred,
+        weights_.predictor,
+        weights_.predictor.F0,
+        weights_.predictor.F0_proj
+    );
+    ggml_tensor* n_curve = build_f0n_curve_predictor(
+        ctx0,
+        en_aligned,
+        style_tensor_pred,
+        weights_.predictor,
+        weights_.predictor.N,
+        weights_.predictor.N_proj
+    );
+
+    // Hard fallback if F0/N heads are unavailable.
+    if (!f0_curve || !n_curve) {
+        const int64_t fallback_len = std::max<int64_t>(2, static_cast<int64_t>(total_frames) * 2);
+        if (!f0_curve) {
+            f0_curve = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, fallback_len, 1, 1);
+            ggml_set_zero(f0_curve);
+        }
+        if (!n_curve) {
+            n_curve = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, fallback_len, 1, 1);
+            ggml_set_zero(n_curve);
+        }
+    }
+
+    // 11. Build Decoder
     if (verbose) {
         std::cerr << "DEBUG: Building Decoder Graph...\n";
     }
-    ggml_tensor* audio_tensor = build_decoder(ctx0, dec_input, style_tensor_dec);
+    ggml_tensor* audio_tensor = build_decoder(ctx0, dec_input, f0_curve, n_curve, style_tensor_dec);
     
-    // 11. Compute Decoder
+    // 12. Compute Decoder
     {
         if (verbose) {
             std::cerr << "DEBUG: Computing Decoder (High VRAM usage)...\n";
@@ -1340,7 +1459,7 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         }
     }
     
-    // 12. Extract decoder head.
+    // 13. Extract decoder head.
     // audio_tensor layout: [Length, Channels, Batch].
     // For Kokoro ISTFTNet, channels should be n_fft + 2:
     // first half = log-magnitude bins, second half = phase logits.
@@ -1456,26 +1575,150 @@ static ggml_tensor* build_resblock_impl(ggml_context* ctx,
 
 
 
-ggml_tensor* Model::build_decoder(ggml_context* ctx, ggml_tensor* en, ggml_tensor* style) {
-    // en: [TotalFrames, Channels(512)] (from upsampling step - already correct!)
-    // Just need to add batch dimension: [TotalFrames, Channels, 1]
-    ggml_tensor* x = ggml_reshape_3d(ctx, en, en->ne[0], en->ne[1], 1);
+ggml_tensor* Model::build_decoder(ggml_context* ctx,
+                                  ggml_tensor* asr,
+                                  ggml_tensor* f0_curve,
+                                  ggml_tensor* n_curve,
+                                  ggml_tensor* style) {
+    auto to_curve3d = [&](ggml_tensor* t) -> ggml_tensor* {
+        if (!t) {
+            return nullptr;
+        }
+        const int nd = ggml_n_dims(t);
+        if (nd == 3) {
+            return t;
+        }
+        if (nd == 2) {
+            if (t->ne[1] == 1) {
+                return ggml_reshape_3d(ctx, t, t->ne[0], t->ne[1], 1);
+            }
+            if (t->ne[0] == 1) {
+                ggml_tensor* tl1 = ggml_cont(ctx, ggml_transpose(ctx, t));
+                return ggml_reshape_3d(ctx, tl1, tl1->ne[0], tl1->ne[1], 1);
+            }
+            return ggml_reshape_3d(ctx, t, t->ne[0], 1, 1);
+        }
+        // 1D
+        return ggml_reshape_3d(ctx, t, t->ne[0], 1, 1);
+    };
 
-    // Upsample stages (Kokoro generator has 2 upsample blocks)
+    auto fit_len = [&](ggml_tensor* t, int64_t target_len) -> ggml_tensor* {
+        if (!t) {
+            return nullptr;
+        }
+        if (t->ne[0] == target_len) {
+            return t;
+        }
+        if (t->ne[0] > target_len) {
+            return crop_time_length(ctx, t, target_len);
+        }
+        ggml_tensor* z = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, target_len, t->ne[1], t->ne[2]);
+        ggml_set_zero(z);
+        return z;
+    };
+
+    // Inputs:
+    // asr: [T, 512]
+    // f0_curve/n_curve: [2T, 1, 1] (preferred)
+    ggml_tensor* asr_3d = ggml_reshape_3d(ctx, asr, asr->ne[0], asr->ne[1], 1); // [T, 512, 1]
+    ggml_tensor* f0_3d = to_curve3d(f0_curve);
+    ggml_tensor* n_3d = to_curve3d(n_curve);
+
+    // Decoder conditioning convs (stride=2) should bring [2T] curves back to [T].
+    ggml_tensor* F0 = nullptr;
+    ggml_tensor* N = nullptr;
+    if (f0_3d && weights_.decoder_F0_conv.weight_v) {
+        F0 = weight_norm_conv1d(ctx,
+                                f0_3d,
+                                weights_.decoder_F0_conv.weight_g,
+                                weights_.decoder_F0_conv.weight_v,
+                                weights_.decoder_F0_conv.bias,
+                                2,
+                                1,
+                                1);
+    }
+    if (n_3d && weights_.decoder_N_conv.weight_v) {
+        N = weight_norm_conv1d(ctx,
+                               n_3d,
+                               weights_.decoder_N_conv.weight_g,
+                               weights_.decoder_N_conv.weight_v,
+                               weights_.decoder_N_conv.bias,
+                               2,
+                               1,
+                               1);
+    }
+
+    const int64_t t_asr = asr_3d->ne[0];
+    if (!F0) {
+        F0 = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, t_asr, 1, 1);
+        ggml_set_zero(F0);
+    }
+    if (!N) {
+        N = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, t_asr, 1, 1);
+        ggml_set_zero(N);
+    }
+    F0 = fit_len(F0, t_asr);
+    N = fit_len(N, t_asr);
+
+    // Decoder encode/decode path (matches Kokoro decoder structure).
+    ggml_tensor* x = ggml_concat(ctx, asr_3d, F0, 1);
+    x = ggml_concat(ctx, x, N, 1);
+
+    if (weights_.decoder_encode.conv1.weight_v) {
+        x = build_adainresblk1d(ctx, x, style, weights_.decoder_encode, false);
+    }
+
+    ggml_tensor* asr_res = asr_3d;
+    if (weights_.decoder_asr_res.weight_v) {
+        asr_res = weight_norm_conv1d(ctx,
+                                     asr_3d,
+                                     weights_.decoder_asr_res.weight_g,
+                                     weights_.decoder_asr_res.weight_v,
+                                     weights_.decoder_asr_res.bias,
+                                     1,
+                                     0,
+                                     1);
+    }
+    asr_res = fit_len(asr_res, t_asr);
+
+    bool with_residual_concat = true;
+    for (int i = 0; i < 4; i++) {
+        if (!weights_.decoder_decode[i].conv1.weight_v) {
+            continue;
+        }
+        if (with_residual_concat) {
+            x = ggml_concat(ctx, x, asr_res, 1);
+            x = ggml_concat(ctx, x, F0, 1);
+            x = ggml_concat(ctx, x, N, 1);
+        }
+
+        const bool upsample = (i == 3);
+        x = build_adainresblk1d(ctx, x, style, weights_.decoder_decode[i], upsample);
+        if (upsample) {
+            with_residual_concat = false;
+        }
+    }
+
+    // Generator stage (keeps logits, ISTFT happens in forward()).
     static constexpr int kUpsampleRates[2] = {10, 6};
     for (int i = 0; i < 2; i++) {
+        x = ggml_leaky_relu(ctx, x, 0.1f, true);
+
         if (weights_.generator.ups[i].weight_v) {
+            const int kernel = static_cast<int>(weights_.generator.ups[i].weight_v->ne[0]);
+            const int stride = kUpsampleRates[i];
+            const int padding = std::max(0, (kernel - stride) / 2);
             x = weight_norm_conv_transpose_1d(
                 ctx,
                 x,
                 weights_.generator.ups[i].weight_g,
                 weights_.generator.ups[i].weight_v,
                 weights_.generator.ups[i].bias,
-                kUpsampleRates[i]
+                stride,
+                padding,
+                1
             );
         }
-
-        x = ggml_leaky_relu(ctx, x, 0.1f, true);
 
         if (weights_.generator.noise_res[i].convs1[0].weight_v) {
             x = build_resblock_impl(ctx, x, style, weights_.generator.noise_res[i]);
@@ -1489,28 +1732,26 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx, ggml_tensor* en, ggml_tenso
             if (blk_idx >= 6 || !weights_.generator.resblocks[blk_idx].convs1[0].weight_v) {
                 continue;
             }
-
             ggml_tensor* r_out = build_resblock_impl(ctx, x, style, weights_.generator.resblocks[blk_idx]);
             mrf_sum = mrf_sum ? ggml_add(ctx, mrf_sum, r_out) : r_out;
             mrf_count++;
         }
-
         if (mrf_sum && mrf_count > 0) {
             x = ggml_scale(ctx, mrf_sum, 1.0f / static_cast<float>(mrf_count));
         }
     }
 
-    // Final activation and post conv
     x = ggml_leaky_relu(ctx, x, 0.1f, true);
-
     if (weights_.generator.conv_post.weight_v) {
-        x = weight_norm_conv1d(ctx, x,
+        x = weight_norm_conv1d(ctx,
+                               x,
                                weights_.generator.conv_post.weight_g,
                                weights_.generator.conv_post.weight_v,
-                               weights_.generator.conv_post.bias, 1, 3);
+                               weights_.generator.conv_post.bias,
+                               1,
+                               3,
+                               1);
     }
-
-    // Keep logits. forward() converts to magnitude/phase and runs ISTFT.
 
     return x;
 }
