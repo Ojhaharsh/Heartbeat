@@ -292,7 +292,11 @@ private:
     ggml_tensor* build_duration_predictor(ggml_context* ctx, ggml_tensor* hidden, ggml_tensor* style);
     
     // Decoder Helpers
-    ggml_tensor* build_decoder(ggml_context* ctx, ggml_tensor* en, ggml_tensor* style);
+    ggml_tensor* build_decoder(ggml_context* ctx,
+                               ggml_tensor* asr,
+                               ggml_tensor* f0_curve,
+                               ggml_tensor* n_curve,
+                               ggml_tensor* style);
     
     // Reference to loader for tensor access
     GGUFLoader* loader_ = nullptr;
