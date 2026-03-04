@@ -4,6 +4,12 @@
 #include <sstream>
 #include <regex>
 #include <cctype>
+#include <cstdio>
+#include <fstream>
+#include <filesystem>
+#include <cstdlib>
+#include <iostream>
+#include <process.h>
 
 #ifdef HEARTBEAT_HAS_ESPEAK
 extern "C" {
@@ -136,7 +142,74 @@ std::string Phonemizer::text_to_ipa(const std::string& text,
     
     return result;
 #else
-    // Fallback: basic letter-to-phoneme (very simplified)
+    // Runtime fallback for Windows: use espeak-ng CLI if available.
+    auto find_espeak_exe = []() -> std::string {
+        const std::vector<std::string> candidates = {
+            "espeak-ng.exe",
+            "C:\\Program Files\\eSpeak NG\\espeak-ng.exe",
+            "C:\\Program Files (x86)\\eSpeak NG\\espeak-ng.exe",
+        };
+        for (const auto& c : candidates) {
+            if (std::filesystem::exists(c)) {
+                return c;
+            }
+        }
+        return {};
+    };
+
+        const std::string espeak_exe = find_espeak_exe();
+    if (!espeak_exe.empty()) {
+        const bool verbose = std::getenv("HEARTBEAT_VERBOSE") != nullptr;
+        const auto tmp_in_path = std::filesystem::absolute(".heartbeat_espeak_input.txt");
+        const auto tmp_out_path = std::filesystem::absolute(".heartbeat_espeak_output.txt");
+        const std::string tmp_in = tmp_in_path.string();
+        const std::string tmp_out = tmp_out_path.string();
+        {
+            std::ofstream ofs(tmp_in, std::ios::binary);
+            ofs << text;
+        }
+
+        // --ipa with --phonout writes IPA directly to a file.
+        const std::string phonout_arg = "--phonout=" + tmp_out;
+        if (verbose) {
+            std::cerr << "DEBUG: Phonemizer CLI exe: " << espeak_exe << "\n";
+            std::cerr << "DEBUG: Phonemizer CLI args: -q --ipa " << phonout_arg << " -f " << tmp_in << "\n";
+        }
+        std::string out;
+        const char* argv[] = {
+            espeak_exe.c_str(),
+            "-q",
+            "--ipa",
+            phonout_arg.c_str(),
+            "-f",
+            tmp_in.c_str(),
+            nullptr
+        };
+        const intptr_t rc = _spawnv(_P_WAIT, espeak_exe.c_str(), argv);
+        if (verbose) {
+            std::cerr << "DEBUG: Phonemizer CLI rc: " << rc << "\n";
+        }
+        if (rc == 0 && std::filesystem::exists(tmp_out_path)) {
+            std::ifstream ifs(tmp_out, std::ios::binary);
+            out.assign(std::istreambuf_iterator<char>(ifs), std::istreambuf_iterator<char>());
+        } else if (verbose) {
+            std::cerr << "DEBUG: espeak-ng CLI failed with rc=" << rc << "\n";
+        }
+        std::filesystem::remove(tmp_in_path);
+        std::filesystem::remove(tmp_out_path);
+
+        // Strip line breaks to keep parser behavior stable.
+        out.erase(std::remove(out.begin(), out.end(), '\r'), out.end());
+        out.erase(std::remove(out.begin(), out.end(), '\n'), out.end());
+        if (verbose) {
+            std::cerr << "DEBUG: Phonemizer CLI IPA bytes: " << out.size() << "\n";
+        }
+        if (!out.empty()) {
+            return out;
+        }
+    }
+
+    // Final fallback: return text as-is.
     return text;
 #endif
 }
