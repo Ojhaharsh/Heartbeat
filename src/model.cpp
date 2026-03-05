@@ -686,18 +686,15 @@ static ggml_tensor* weight_norm_conv_transpose_1d(ggml_context* ctx,
 static ggml_tensor* build_snake(ggml_context* ctx, ggml_tensor* x, ggml_tensor* alpha) {
     if (!alpha) return ggml_leaky_relu(ctx, x, 0.1, true); // Fallback
     
-    // alpha is [1, C, 1]
-    // result = x + (1/alpha) * sin^2(alpha * x)
+    // Snake activation: x + (1/alpha) * sin(alpha * x)^2
+    // alpha shape: [1, C, 1] — broadcast to [T, C, 1] to match x
     ggml_tensor* alpha_rep = ggml_repeat(ctx, alpha, x);
     ggml_tensor* ax = ggml_mul(ctx, x, alpha_rep);
     ggml_tensor* sin_ax = ggml_sin(ctx, ax);
     ggml_tensor* sin2_ax = ggml_sqr(ctx, sin_ax);
     
-    // 1/alpha
-    ggml_tensor* inv_alpha = ggml_div(ctx, ggml_new_f32(ctx, 1.0f), alpha);
-    ggml_tensor* inv_alpha_rep = ggml_repeat(ctx, inv_alpha, x);
-    
-    ggml_tensor* term2 = ggml_mul(ctx, sin2_ax, inv_alpha_rep);
+    // (1/alpha) * sin^2(alpha*x) = sin^2(alpha*x) / alpha
+    ggml_tensor* term2 = ggml_div(ctx, sin2_ax, alpha_rep);
     return ggml_add(ctx, x, term2);
 }
 
@@ -771,7 +768,7 @@ static ggml_tensor* upsample_nearest_2x(ggml_context* ctx, ggml_tensor* x) {
 static ggml_tensor* build_adainresblk1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style, const AdainResBlk1dWeights& w, bool upsample) {
     const int64_t target_len = upsample ? (x->ne[0] * 2) : x->ne[0];
 
-    // shortcut
+    // shortcut: nearest-neighbor upsample then optional 1x1 conv
     ggml_tensor* shortcut = x;
     if (upsample) {
         shortcut = upsample_nearest_2x(ctx, shortcut);
@@ -786,9 +783,14 @@ static ggml_tensor* build_adainresblk1d(ggml_context* ctx, ggml_tensor* x, ggml_
     res = ggml_leaky_relu(ctx, res, 0.2, true);
     
     if (upsample) {
-        // Approximate depthwise transposed-conv with nearest upsample.
-        res = upsample_nearest_2x(ctx, res);
-        res = crop_time_length(ctx, res, target_len);
+        // Reference uses depthwise ConvTranspose1d(k=3, s=2, groups=dim, p=1, output_padding=1)
+        if (w.pool.weight_v) {
+            res = weight_norm_conv_transpose_1d(ctx, res, w.pool.weight_g, w.pool.weight_v, w.pool.bias, 2, 0, 1);
+            res = crop_time_length(ctx, res, target_len);
+        } else {
+            res = upsample_nearest_2x(ctx, res);
+            res = crop_time_length(ctx, res, target_len);
+        }
     }
     
     res = weight_norm_conv1d(ctx, res, w.conv1.weight_g, w.conv1.weight_v, w.conv1.bias, 1, 1, 1);
@@ -1637,12 +1639,25 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     
     ggml_tensor* en_aligned = ggml_cont(ctx0, ggml_transpose(ctx0, en_input)); // [d_enc_dim, total_frames]
     
+    if (verbose) {
+        std::cerr << "DEBUG: en_aligned shape: [" << en_aligned->ne[0] << ", " << en_aligned->ne[1] << "]\n";
+    }
+    
     // Shared LSTM — called once, output feeds both F0 and N branches.
     ggml_tensor* shared_out = en_aligned;
     if (weights_.predictor.shared_lstm.weight_ih) {
+        if (verbose) {
+            std::cerr << "DEBUG: Running shared LSTM...\n";
+        }
         shared_out = lstm_forward(ctx0, en_aligned, weights_.predictor.shared_lstm);
+        if (verbose) {
+            std::cerr << "DEBUG: shared_out shape: [" << shared_out->ne[0] << ", " << shared_out->ne[1] << "]\n";
+        }
     }
     
+    if (verbose) {
+        std::cerr << "DEBUG: Building F0 curve predictor...\n";
+    }
     ggml_tensor* f0_curve = build_f0n_curve_predictor(
         ctx0,
         shared_out,
@@ -1650,6 +1665,9 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         weights_.predictor.F0,
         weights_.predictor.F0_proj
     );
+    if (verbose) {
+        std::cerr << "DEBUG: Building N curve predictor...\n";
+    }
     ggml_tensor* n_curve = build_f0n_curve_predictor(
         ctx0,
         shared_out,
@@ -1674,6 +1692,9 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     // 11. Build Decoder
     if (verbose) {
         std::cerr << "DEBUG: Building Decoder Graph...\n";
+        std::cerr << "DEBUG: dec_input: [" << dec_input->ne[0] << ", " << dec_input->ne[1] << "]\n";
+        if (f0_curve) std::cerr << "DEBUG: f0_curve: [" << f0_curve->ne[0] << ", " << f0_curve->ne[1] << ", " << f0_curve->ne[2] << "]\n";
+        if (n_curve) std::cerr << "DEBUG: n_curve: [" << n_curve->ne[0] << ", " << n_curve->ne[1] << ", " << n_curve->ne[2] << "]\n";
     }
     ggml_tensor* audio_tensor = build_decoder(ctx0, dec_input, f0_curve, n_curve, style_tensor_dec);
     
@@ -1754,7 +1775,15 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     return output;
 }
 
-// Helper for ResBlock
+// Helper for ResBlock (AdaINResBlock1 in reference)
+// Reference forward: for each of 3 stages:
+//   xt = adain1(x, s)
+//   xt = xt + (1/alpha1) * sin(alpha1 * xt)^2   (Snake activation)
+//   xt = conv1(xt)                                (dilated conv)
+//   xt = adain2(xt, s)
+//   xt = xt + (1/alpha2) * sin(alpha2 * xt)^2   (Snake activation)
+//   xt = conv2(xt)                                (dilation=1 conv)
+//   x = xt + x                                   (residual add)
 static ggml_tensor* build_resblock_impl(ggml_context* ctx, 
                                         ggml_tensor* x, 
                                         ggml_tensor* style, 
@@ -1766,15 +1795,15 @@ static ggml_tensor* build_resblock_impl(ggml_context* ctx,
             continue;
         }
 
-        ggml_tensor* input = x; 
+        ggml_tensor* residual = x; 
         
         // 1. AdaIN 1
         ggml_tensor* h = build_adain(ctx, x, style, w.adain1[j]);
         
-        // 2. LeakyReLU
-        h = ggml_leaky_relu(ctx, h, 0.1f, true); 
+        // 2. Snake activation: x + (1/alpha) * sin(alpha * x)^2
+        h = build_snake(ctx, h, w.alpha1[j]);
         
-        // 3. Conv1
+        // 3. Conv1 (dilated)
         int K1 = (int)w.convs1[j].weight_v->ne[0];
         int P1 = dilations[j] * (K1 - 1) / 2;
         h = weight_norm_conv1d(ctx, h, w.convs1[j].weight_g, w.convs1[j].weight_v, w.convs1[j].bias, 1, P1, dilations[j]);
@@ -1782,23 +1811,16 @@ static ggml_tensor* build_resblock_impl(ggml_context* ctx,
         // 4. AdaIN 2
         h = build_adain(ctx, h, style, w.adain2[j]);
         
-        // 5. LeakyReLU
-        h = ggml_leaky_relu(ctx, h, 0.1f, true);
+        // 5. Snake activation
+        h = build_snake(ctx, h, w.alpha2[j]);
         
-        // 6. Conv2
+        // 6. Conv2 (dilation=1)
         int K2 = (int)w.convs2[j].weight_v->ne[0];
         int P2 = (K2 - 1) / 2;
         h = weight_norm_conv1d(ctx, h, w.convs2[j].weight_g, w.convs2[j].weight_v, w.convs2[j].bias, 1, P2, 1);
         
-        // Residual Add with Alpha
-        if (w.alpha2[j]) {
-             // x = alpha1 * input + alpha2 * h ? OR input + alpha * h?
-             // Usually it's input + alpha * h.
-             h = ggml_mul(ctx, h, ggml_repeat(ctx, w.alpha2[j], h));
-             x = ggml_add(ctx, input, h);
-        } else {
-             x = ggml_add(ctx, input, h);
-        }
+        // 7. Residual add (simple addition, no alpha scaling)
+        x = ggml_add(ctx, residual, h);
     }
     return x;
 }
