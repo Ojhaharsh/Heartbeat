@@ -37,6 +37,19 @@ public:
     DSP& operator=(DSP&& other) noexcept;
     
     /**
+     * Perform forward STFT (center=true, matching torch.stft defaults).
+     * @param signal Input time-domain signal.
+     * @param out_magnitude Output magnitude spectrogram [n_frames * bins].
+     * @param out_phase Output phase spectrogram [n_frames * bins].
+     * @param out_n_frames Number of resulting STFT frames.
+     * @return Number of frequency bins per frame (n_fft/2 + 1).
+     */
+    int stft(const std::vector<float>& signal,
+             std::vector<float>& out_magnitude,
+             std::vector<float>& out_phase,
+             int& out_n_frames);
+
+    /**
      * Perform ISTFT to synthesize audio from magnitude and phase.
      * @param magnitude Magnitude spectrogram [n_mels, n_frames].
      * @param phase Phase spectrogram [n_mels, n_frames].
@@ -121,11 +134,16 @@ private:
               std::complex<float>* out, 
               int n);
     
+    void fft(const std::complex<float>* in,
+             std::complex<float>* out,
+             int n);
+    
     DSPConfig config_;
     std::vector<float> window_;
     
-    // KissFFT state (opaque pointer)
-    void* fft_cfg_ = nullptr;
+    // KissFFT state (opaque pointers)
+    void* fft_cfg_ = nullptr;         // inverse FFT
+    void* fft_fwd_cfg_ = nullptr;     // forward FFT
 };
 
 /**
