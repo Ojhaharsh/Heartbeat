@@ -76,6 +76,10 @@ static int heartbeat_max_total_frames() {
     return heartbeat_parse_env_int("HEARTBEAT_MAX_TOTAL_FRAMES", 1024, 64, 20000);
 }
 
+static int heartbeat_min_avg_token_frames() {
+    return heartbeat_parse_env_int("HEARTBEAT_MIN_AVG_TOKEN_FRAMES", 4, 1, 20);
+}
+
 Model::Model() = default;
 
 Model::~Model() {
