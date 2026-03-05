@@ -65,8 +65,10 @@ std::vector<float> DSP::hanning_window(int size) {
     std::vector<float> window(size);
     constexpr float PI = 3.14159265358979323846f;
     
+    // Use periodic Hanning window (matching PyTorch torch.hann_window(periodic=True))
+    // periodic: divide by size, not (size-1)
     for (int i = 0; i < size; i++) {
-        window[i] = 0.5f * (1.0f - std::cos(2.0f * PI * i / (size - 1)));
+        window[i] = 0.5f * (1.0f - std::cos(2.0f * PI * i / size));
     }
     
     return window;
