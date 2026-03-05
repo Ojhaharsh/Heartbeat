@@ -749,13 +749,19 @@ static ggml_tensor* upsample_nearest(ggml_context* ctx, ggml_tensor* x, int fact
     if (factor <= 1) {
         return x;
     }
-    if (!x || ggml_n_dims(x) < 3) {
+    if (!x) {
         return x;
     }
+    // Handle both 2D [L, C] and 3D [L, C, N] tensors.
+    // ggml_n_dims may return 2 even for [L, C, 1] since ne[2]==1.
     const int64_t len = x->ne[0];
     const int64_t ch = x->ne[1];
-    const int64_t batch = x->ne[2];
-    ggml_tensor* x4 = ggml_reshape_4d(ctx, x, 1, len, ch, batch);
+    const int64_t batch = (x->ne[2] > 0) ? x->ne[2] : 1;
+    if (len <= 0 || ch <= 0) {
+        return x;
+    }
+    ggml_tensor* x3 = ggml_reshape_3d(ctx, x, len, ch, batch);
+    ggml_tensor* x4 = ggml_reshape_4d(ctx, x3, 1, len, ch, batch);
     ggml_tensor* tgt = ggml_new_tensor_4d(ctx, x->type, factor, len, ch, batch);
     ggml_tensor* rep = ggml_repeat(ctx, x4, tgt);
     return ggml_reshape_3d(ctx, rep, len * factor, ch, batch);
@@ -1465,10 +1471,15 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
             std::cerr << "DEBUG: Building ASR Text Encoder (CNN-LSTM)...\n";
         }
         hidden_asr = build_cnn_lstm_encoder(ctx0, asr_emb, weights_);
-        if (verbose) {
+        // CRITICAL: Always compute hidden_asr graph — the decoder reads
+        // its data for duration expansion.  Without this, the tensor
+        // contains uninitialised memory and the output is pure noise.
+        {
             struct ggml_cgraph* gf_asr = ggml_new_graph(ctx0);
             ggml_build_forward_expand(gf_asr, hidden_asr);
             ggml_graph_compute_with_ctx(ctx0, gf_asr, n_threads);
+        }
+        if (verbose) {
             float* d = (float*)hidden_asr->data;
             std::cerr << "DEBUG: ASR Encoder [0]=" << d[0] << " is_nan=" << std::isnan(d[0]) << "\n";
         }
@@ -1609,9 +1620,12 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     const int d_enc_dim = d_enc ? static_cast<int>(d_enc->ne[0]) : target_hidden_dim;
     
     // en_input: duration-expanded DurationEncoder features for F0/N
-    ggml_tensor* en_input  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, total_frames, d_enc_dim);
+    // GGML 2-D tensor [ne0, ne1]:  element(i0, i1) lives at data[i1*ne0 + i0].
+    // We fill data with dim-contiguous blocks per frame (memcpy of dim floats),
+    // so ne0 must be the feature dimension, ne1 the frame count.
+    ggml_tensor* en_input  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, d_enc_dim, total_frames);
     // dec_input: duration-expanded ASR features for decoder
-    ggml_tensor* dec_input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, total_frames, target_hidden_dim);
+    ggml_tensor* dec_input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, target_hidden_dim, total_frames);
     
     {
         float* src_ptr_enc = d_enc ? (float*)d_enc->data : (float*)hidden_dur->data;
@@ -1649,7 +1663,8 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     //   F0 = F0_blocks(x, s)
     //   N  = N_blocks(x, s)
     
-    ggml_tensor* en_aligned = ggml_cont(ctx0, ggml_transpose(ctx0, en_input)); // [d_enc_dim, total_frames]
+    // en_input is already [d_enc_dim, total_frames] — no transpose needed.
+    ggml_tensor* en_aligned = en_input; // [d_enc_dim, total_frames]
     
     if (verbose) {
         std::cerr << "DEBUG: en_aligned shape: [" << en_aligned->ne[0] << ", " << en_aligned->ne[1] << "]\n";
@@ -1708,7 +1723,11 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         if (f0_curve) std::cerr << "DEBUG: f0_curve: [" << f0_curve->ne[0] << ", " << f0_curve->ne[1] << ", " << f0_curve->ne[2] << "]\n";
         if (n_curve) std::cerr << "DEBUG: n_curve: [" << n_curve->ne[0] << ", " << n_curve->ne[1] << ", " << n_curve->ne[2] << "]\n";
     }
-    ggml_tensor* audio_tensor = build_decoder(ctx0, dec_input, f0_curve, n_curve, style_tensor_dec);
+    // dec_input is [hidden_dim, total_frames] (feature-major for correct fill).
+    // The decoder's conv1d needs [time, channels, batch], so transpose to
+    // [total_frames, hidden_dim] and make contiguous.
+    ggml_tensor* dec_input_t = ggml_cont(ctx0, ggml_transpose(ctx0, dec_input));
+    ggml_tensor* audio_tensor = build_decoder(ctx0, dec_input_t, f0_curve, n_curve, style_tensor_dec);
     
     // 12. Compute Decoder
     {
@@ -1983,15 +2002,17 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
     }
 
     // Generator stage (keeps logits, ISTFT happens in forward()).
-    // Build a lightweight F0-derived conditioning tensor for noise branches.
-    const int generator_scale = 10 * 6;
+    // Harmonic source conditioning: The reference Python code generates sine
+    // waves from F0 via SineGen, takes their STFT, and concatenates
+    // magnitude+phase as the "har" tensor.  Implementing SineGen+STFT in pure
+    // GGML is very complex, so we use a zero tensor instead.  This removes the
+    // periodic excitation source but prevents raw F0 values (100-200 Hz as
+    // floats) from corrupting the signal with massive activations.
+    const int generator_scale = 10 * 6; // prod(upsample_rates)
     const int cond_channels = std::max(2, params_.istft_n_fft + 2);
-    ggml_tensor* har_base = upsample_nearest(ctx, f0_3d, generator_scale); // [T*60, 1, 1]
-    ggml_tensor* har = nullptr;
-    if (har_base) {
-        ggml_tensor* har_tgt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, har_base->ne[0], cond_channels, 1);
-        har = ggml_repeat(ctx, har_base, har_tgt); // [T*60, 22, 1]
-    }
+    const int64_t har_time = f0_3d ? f0_3d->ne[0] * generator_scale : t_asr * generator_scale;
+    ggml_tensor* har = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, har_time, cond_channels, 1);
+    ggml_set_zero(har);
 
     static constexpr int kUpsampleRates[2] = {10, 6};
     for (int i = 0; i < 2; i++) {
@@ -2024,6 +2045,13 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
             } else {
                 x = crop_time_length(ctx, x, target_len);
             }
+        }
+
+        // Reference: if i == num_upsamples - 1: x = self.reflection_pad(x)
+        // Adds 1 sample of reflection padding on the left (nn.ReflectionPad1d((1, 0)))
+        if (i == 1) {
+            x = ggml_cont(ctx, x); // ensure contiguous for pad
+            x = ggml_pad_reflect_1d(ctx, x, 1, 0);
         }
 
         ggml_tensor* x_source = nullptr;
