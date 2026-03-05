@@ -790,10 +790,15 @@ static ggml_tensor* build_adainresblk1d(ggml_context* ctx, ggml_tensor* x, ggml_
         res = crop_time_length(ctx, res, target_len);
     }
     
-    res = weight_norm_conv1d(ctx, res, w.conv1.weight_g, w.conv1.weight_v, w.conv1.bias, 1, 1, 1);
+    // Derive padding from actual kernel size for "same" output: P = (K-1)/2
+    const int K1 = w.conv1.weight_v ? static_cast<int>(w.conv1.weight_v->ne[0]) : 3;
+    const int P1 = (K1 - 1) / 2;
+    res = weight_norm_conv1d(ctx, res, w.conv1.weight_g, w.conv1.weight_v, w.conv1.bias, 1, P1, 1);
     res = build_adain(ctx, res, style, w.norm2);
     res = ggml_leaky_relu(ctx, res, 0.2, true);
-    res = weight_norm_conv1d(ctx, res, w.conv2.weight_g, w.conv2.weight_v, w.conv2.bias, 1, 1, 1);
+    const int K2 = w.conv2.weight_v ? static_cast<int>(w.conv2.weight_v->ne[0]) : 3;
+    const int P2 = (K2 - 1) / 2;
+    res = weight_norm_conv1d(ctx, res, w.conv2.weight_g, w.conv2.weight_v, w.conv2.bias, 1, P2, 1);
     
     // add shortcut and scale by rsqrt(2)
     ggml_tensor* out = ggml_add(ctx, res, shortcut);
@@ -911,13 +916,13 @@ ggml_tensor* Model::build_embeddings(ggml_context* ctx,
 ggml_tensor* Model::build_attention(ggml_context* ctx,
                                      ggml_tensor* hidden,
                                      const ALBERTLayer& layer) {
-    // Hidden: [seq, hidden] (768)
+    // Hidden: [hidden_size, seq_len] in GGML (ne[0]=hidden_size, ne[1]=seq_len)
+    const int hidden_size = static_cast<int>(hidden->ne[0]);
+    const int seq_len = static_cast<int>(hidden->ne[1]);
+    const int n_heads = params_.num_heads > 0 ? params_.num_heads : 12;
+    const int head_dim = hidden_size / n_heads;
     
-    // 1. Projections
-    // ggml_mul_mat(W, x) -> W * x^T.
-    // W: [768, 768]. x: [seq, 768] (physically 768 contiguous).
-    // result: [768, seq].
-    
+    // 1. Project Q, K, V: [hidden_size, seq_len]
     ggml_tensor* Q = ggml_mul_mat(ctx, layer.q_weight, hidden);
     if (layer.q_bias) Q = ggml_add(ctx, Q, layer.q_bias);
     
@@ -927,28 +932,38 @@ ggml_tensor* Model::build_attention(ggml_context* ctx,
     ggml_tensor* V = ggml_mul_mat(ctx, layer.v_weight, hidden);
     if (layer.v_bias) V = ggml_add(ctx, V, layer.v_bias);
     
+    // 2. Reshape to [head_dim, n_heads, seq_len] then permute to [head_dim, seq_len, n_heads]
+    //    This groups the batch dimension by attention head for batched matmul.
+    Q = ggml_reshape_3d(ctx, Q, head_dim, n_heads, seq_len);
+    K = ggml_reshape_3d(ctx, K, head_dim, n_heads, seq_len);
+    V = ggml_reshape_3d(ctx, V, head_dim, n_heads, seq_len);
+    
+    Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3)); // [head_dim, seq_len, n_heads]
+    K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
+    V = ggml_cont(ctx, ggml_permute(ctx, V, 0, 2, 1, 3));
+    
+    // 3. Per-head attention: scores = K^T * Q / sqrt(head_dim)
+    //    ggml_mul_mat(A, B) = A^T * B.  Both [head_dim, seq, n_heads].
+    //    Result: [seq, seq, n_heads]  (one attention matrix per head).
     ggml_tensor* scores = ggml_mul_mat(ctx, K, Q);
-    
-    // DEBUG: Check scores
-    // scores = ggml_check_nan(ctx, scores); // Not available in all GGML versions?
-    
-    float scale = 1.0f / sqrtf((float)768 / 12.0f);
+    float scale = 1.0f / sqrtf(static_cast<float>(head_dim));
     scores = ggml_scale(ctx, scores, scale);
-    // Softmax
     scores = ggml_soft_max(ctx, scores);
     
-    ggml_tensor* V_trans = ggml_transpose(ctx, V);
-    // Explicitly make contiguous to avoid GGML assertion failure in mul_mat
-    ggml_tensor* V_trans_cont = ggml_cont(ctx, V_trans);
+    // 4. Context = V * softmax(scores) per head
+    //    V: [head_dim, seq, n_heads] → transpose to [seq, head_dim, n_heads] for matmul
+    ggml_tensor* V_perm = ggml_cont(ctx, ggml_permute(ctx, V, 1, 0, 2, 3)); // [seq, head_dim, n_heads]
+    ggml_tensor* context = ggml_mul_mat(ctx, V_perm, scores); // [head_dim, seq_len, n_heads]
     
-    ggml_tensor* context = ggml_mul_mat(ctx, V_trans_cont, scores);
+    // 5. Concatenate heads: [head_dim, seq_len, n_heads] → [head_dim, n_heads, seq_len] → [hidden_size, seq_len]
+    context = ggml_cont(ctx, ggml_permute(ctx, context, 0, 2, 1, 3)); // [head_dim, n_heads, seq_len]
+    context = ggml_reshape_2d(ctx, context, head_dim * n_heads, seq_len); // [hidden_size, seq_len]
     
+    // 6. Output projection
     ggml_tensor* out = ggml_mul_mat(ctx, layer.o_weight, context);
     if (layer.o_bias) out = ggml_add(ctx, out, layer.o_bias);
     
-    // Add NaN check for output
-    // float* d = (float*)out->data; // Cannot check during graph building
-    
+    // 7. Residual + post-LayerNorm
     out = ggml_add(ctx, hidden, out);
     out = layer_norm(ctx, out, layer.attn_ln_weight, layer.attn_ln_bias);
     
@@ -1714,9 +1729,27 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     // first half = log-magnitude bins, second half = phase logits.
     int n_frames = (int)audio_tensor->ne[0];
     int n_channels = (int)audio_tensor->ne[1];
-    const int n_fft = params_.istft_n_fft > 0 ? params_.istft_n_fft : 16;
-    const int n_bins = n_fft / 2 + 1;
-    const int expected_channels = 2 * n_bins;
+    int n_fft = params_.istft_n_fft > 0 ? params_.istft_n_fft : 16;
+    int n_bins = n_fft / 2 + 1;
+    int expected_channels = 2 * n_bins;
+    
+    // Safety: if the decoder output channels don't match the configured n_fft,
+    // auto-detect from the actual output. The conv_post outputs (post_n_fft + 2)
+    // channels, so we can recover: n_fft = n_channels - 2, n_bins = n_channels / 2.
+    if (n_channels != expected_channels && n_channels >= 4 && n_channels % 2 == 0) {
+        const int detected_n_fft = n_channels - 2;
+        const int detected_bins = n_channels / 2;
+        if (2 * detected_bins == n_channels) {
+            if (verbose) {
+                std::cerr << "WARNING: ISTFT n_fft mismatch (configured=" << n_fft
+                          << ", detected=" << detected_n_fft
+                          << "). Auto-correcting to match decoder output.\n";
+            }
+            n_fft = detected_n_fft;
+            n_bins = detected_bins;
+            expected_channels = n_channels;
+        }
+    }
     float* audio_data = (float*)audio_tensor->data;
 
     if (verbose) {
@@ -1967,6 +2000,11 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
         if (weights_.generator.ups[i].weight_v) {
             const int stride = kUpsampleRates[i];
             const int64_t in_len = x->ne[0];
+            // Reference: padding = (kernel - stride) / 2
+            // GGML conv_transpose_1d requires p0==0, so we compute with padding=0
+            // and then manually crop tc_pad samples from each side.
+            const int kernel = static_cast<int>(weights_.generator.ups[i].weight_v->ne[0]);
+            const int tc_pad = (kernel - stride) / 2;
             x = weight_norm_conv_transpose_1d(
                 ctx,
                 x,
@@ -1974,11 +2012,18 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
                 weights_.generator.ups[i].weight_v,
                 weights_.generator.ups[i].bias,
                 stride,
-                0,
+                0,   // GGML requires padding=0
                 1
             );
-            // ggml transposed-conv currently requires padding=0, so trim to stride-exact length.
-            x = crop_time_length(ctx, x, in_len * stride);
+            // Simulate padding by slicing [tc_pad .. tc_pad + in_len*stride) from the output.
+            const int64_t target_len = in_len * stride;
+            if (tc_pad > 0 && x->ne[0] > target_len) {
+                const size_t byte_offset = static_cast<size_t>(tc_pad) * x->nb[0];
+                x = ggml_view_3d(ctx, x, target_len, x->ne[1], x->ne[2],
+                                 x->nb[1], x->nb[2], byte_offset);
+            } else {
+                x = crop_time_length(ctx, x, target_len);
+            }
         }
 
         ggml_tensor* x_source = nullptr;
