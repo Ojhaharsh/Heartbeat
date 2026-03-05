@@ -289,7 +289,7 @@ private:
     ggml_tensor* build_encoder(ggml_context* ctx, ggml_tensor* hidden);
     
     // Predictor Helpers
-    ggml_tensor* build_duration_predictor(ggml_context* ctx, ggml_tensor* hidden, ggml_tensor* style);
+    ggml_tensor* build_duration_predictor(ggml_context* ctx, ggml_tensor* hidden, ggml_tensor* style, ggml_tensor** d_enc_out = nullptr);
     
     // Decoder Helpers
     ggml_tensor* build_decoder(ggml_context* ctx,
