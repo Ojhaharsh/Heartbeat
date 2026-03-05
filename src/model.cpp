@@ -148,8 +148,8 @@ bool Model::load_weights(GGUFLoader& loader) {
     // Helper for Linear weights
     auto get_linear = [&](const std::string& prefix) -> LinearWeights {
         LinearWeights w;
-        w.weight = get_tensor({prefix + ".weight", prefix + ".linear_layer.weight"});
-        w.bias = get_tensor({prefix + ".bias", prefix + ".linear_layer.bias"});
+        w.weight = get_tensor({prefix + ".weight", prefix + ".linear_layer.weight", prefix + ".fc.weight"});
+        w.bias = get_tensor({prefix + ".bias", prefix + ".linear_layer.bias", prefix + ".fc.bias"});
         return w;
     };
     
@@ -623,6 +623,26 @@ static ggml_tensor* weight_norm_conv1d(ggml_context* ctx,
     return h;
 }
 
+static ggml_tensor* plain_conv1d(ggml_context* ctx,
+                                 ggml_tensor* x,
+                                 ggml_tensor* w,
+                                 ggml_tensor* bias,
+                                 int stride = 1,
+                                 int padding = 0,
+                                 int dilation = 1) {
+    if (!x || !w) {
+        return x;
+    }
+
+    ggml_tensor* w_cont = ggml_cont(ctx, w);
+    ggml_tensor* w_f16 = ggml_cast(ctx, w_cont, GGML_TYPE_F16);
+    ggml_tensor* h = ggml_conv_1d(ctx, w_f16, x, stride, padding, dilation);
+    if (bias) {
+        h = ggml_add(ctx, h, ggml_repeat(ctx, ggml_reshape_3d(ctx, bias, 1, bias->ne[0], 1), h));
+    }
+    return h;
+}
+
 static ggml_tensor* weight_norm_conv_transpose_1d(ggml_context* ctx,
                                                 ggml_tensor* x,
                                                 ggml_tensor* w_g,
@@ -715,7 +735,10 @@ static ggml_tensor* crop_time_length(ggml_context* ctx, ggml_tensor* x, int64_t 
     return ggml_view_3d(ctx, x, target_len, x->ne[1], x->ne[2], x->nb[1], x->nb[2], 0);
 }
 
-static ggml_tensor* upsample_nearest_2x(ggml_context* ctx, ggml_tensor* x) {
+static ggml_tensor* upsample_nearest(ggml_context* ctx, ggml_tensor* x, int factor) {
+    if (factor <= 1) {
+        return x;
+    }
     if (!x || ggml_n_dims(x) < 3) {
         return x;
     }
@@ -723,9 +746,13 @@ static ggml_tensor* upsample_nearest_2x(ggml_context* ctx, ggml_tensor* x) {
     const int64_t ch = x->ne[1];
     const int64_t batch = x->ne[2];
     ggml_tensor* x4 = ggml_reshape_4d(ctx, x, 1, len, ch, batch);
-    ggml_tensor* tgt = ggml_new_tensor_4d(ctx, x->type, 2, len, ch, batch);
+    ggml_tensor* tgt = ggml_new_tensor_4d(ctx, x->type, factor, len, ch, batch);
     ggml_tensor* rep = ggml_repeat(ctx, x4, tgt);
-    return ggml_reshape_3d(ctx, rep, len * 2, ch, batch);
+    return ggml_reshape_3d(ctx, rep, len * factor, ch, batch);
+}
+
+static ggml_tensor* upsample_nearest_2x(ggml_context* ctx, ggml_tensor* x) {
+    return upsample_nearest(ctx, x, 2);
 }
 
 static ggml_tensor* build_adainresblk1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style, const AdainResBlk1dWeights& w, bool upsample) {
@@ -787,6 +814,38 @@ static ggml_tensor* linear_forward(ggml_context* ctx, ggml_tensor* x, const Line
     if (w.bias) {
         y = ggml_add(ctx, y, ggml_repeat(ctx, w.bias, y));
     }
+    return y;
+}
+
+static ggml_tensor* style_layer_norm(ggml_context* ctx,
+                                     ggml_tensor* x,
+                                     ggml_tensor* style,
+                                     const LinearWeights& fc) {
+    if (!x || !style || !fc.weight) {
+        return x;
+    }
+
+    const int channels = static_cast<int>(x->ne[0]);
+    if (channels <= 0) {
+        return x;
+    }
+
+    ggml_tensor* h = linear_forward(ctx, style, fc); // expected [2C]
+    if (!h || h->ne[0] < 2 * channels) {
+        return x;
+    }
+
+    ggml_tensor* gamma = ggml_view_1d(ctx, h, channels, 0);
+    ggml_tensor* beta = ggml_view_1d(ctx, h, channels, channels * sizeof(float));
+
+    ggml_tensor* x_norm = ggml_norm(ctx, x, 1e-5f);
+    ggml_tensor* gamma2d = ggml_repeat(ctx, ggml_reshape_2d(ctx, gamma, channels, 1), x_norm);
+    ggml_tensor* beta2d = ggml_repeat(ctx, ggml_reshape_2d(ctx, beta, channels, 1), x_norm);
+    ggml_tensor* one = ggml_new_f32(ctx, 1.0f);
+    ggml_tensor* one_rep = ggml_repeat(ctx, one, gamma2d);
+
+    ggml_tensor* y = ggml_mul(ctx, x_norm, ggml_add(ctx, one_rep, gamma2d));
+    y = ggml_add(ctx, y, beta2d);
     return y;
 }
 
@@ -905,48 +964,128 @@ static ggml_tensor* lstm_forward(ggml_context* ctx,
                                  ggml_tensor* x, 
                                  const LSTMWeights& w) {
     if (!x || !w.weight_ih || !w.weight_hh) return x;
-    
-    // x: [InDim, SeqLen]
-    // w.weight_ih: [InDim, 4*HDim]
-    // w.weight_hh: [HDim, 4*HDim]
-    
-    int h_dim = (int)w.weight_hh->ne[0]; // Hidden dimension (e.g. 256)
-    
-    // Standard LSTM cell logic (Simplified for graph performance)
-    ggml_tensor* gates = ggml_mul_mat(ctx, w.weight_ih, x);
-    if (w.bias_ih) gates = ggml_add(ctx, gates, w.bias_ih);
-    
-    // Split gates into i, f, g, o using h_dim
-    ggml_tensor* i = ggml_view_2d(ctx, gates, h_dim, x->ne[1], gates->nb[1], 0);
-    ggml_tensor* f = ggml_view_2d(ctx, gates, h_dim, x->ne[1], gates->nb[1], h_dim * sizeof(float));
-    ggml_tensor* g = ggml_view_2d(ctx, gates, h_dim, x->ne[1], gates->nb[1], 2 * h_dim * sizeof(float));
-    ggml_tensor* o = ggml_view_2d(ctx, gates, h_dim, x->ne[1], gates->nb[1], 3 * h_dim * sizeof(float));
-    
-    i = ggml_sigmoid(ctx, i);
-    f = ggml_sigmoid(ctx, f);
-    g = ggml_tanh(ctx, g);
-    o = ggml_sigmoid(ctx, o);
-    
-    // c = f*c_prev + i*g. Assume c_prev = 0.
-    ggml_tensor* c = ggml_mul(ctx, i, g);
-    ggml_tensor* h = ggml_mul(ctx, o, ggml_tanh(ctx, c));
-    
-    if (w.weight_ih_r) {
-        ggml_tensor* gates_r = ggml_mul_mat(ctx, w.weight_ih_r, x);
-        if (w.bias_ih_r) gates_r = ggml_add(ctx, gates_r, w.bias_ih_r);
-        
-        ggml_tensor* i_r = ggml_view_2d(ctx, gates_r, h_dim, x->ne[1], gates_r->nb[1], 0);
-        ggml_tensor* g_r = ggml_view_2d(ctx, gates_r, h_dim, x->ne[1], gates_r->nb[1], 2 * h_dim * sizeof(float));
-        ggml_tensor* o_r = ggml_view_2d(ctx, gates_r, h_dim, x->ne[1], gates_r->nb[1], 3 * h_dim * sizeof(float));
-        
-        ggml_tensor* h_r = ggml_mul(ctx, ggml_sigmoid(ctx, o_r), ggml_tanh(ctx, ggml_mul(ctx, ggml_sigmoid(ctx, i_r), ggml_tanh(ctx, g_r))));
-        
-        // Concat forward and reverse [2*h_dim, SeqLen]
-        // This will be [512, SeqLen] if h_dim=256
-        return ggml_concat(ctx, h, h_r, 0);
+
+    const int in_dim = static_cast<int>(x->ne[0]);
+    const int seq_len = static_cast<int>(x->ne[1]);
+    int h_dim = static_cast<int>(w.weight_hh->ne[0]);
+    if (h_dim <= 0) {
+        h_dim = static_cast<int>(w.weight_ih->ne[1] / 4);
     }
-    
-    return h;
+    if (in_dim <= 0 || seq_len <= 0 || h_dim <= 0) {
+        return x;
+    }
+
+    auto read_scalar = [](const ggml_tensor* t, int64_t off0, int64_t off1 = 0) -> float {
+        if (!t) {
+            return 0.0f;
+        }
+        const char* p = static_cast<const char*>(t->data) + off0 * t->nb[0] + off1 * t->nb[1];
+        if (t->type == GGML_TYPE_F32) {
+            return *reinterpret_cast<const float*>(p);
+        }
+        if (t->type == GGML_TYPE_F16) {
+            return ggml_fp16_to_fp32(*reinterpret_cast<const ggml_fp16_t*>(p));
+        }
+        return 0.0f;
+    };
+
+    auto mat_get = [&](const ggml_tensor* m, int r, int c, int expect_r, int expect_c) -> float {
+        if (!m) {
+            return 0.0f;
+        }
+        // Export can be [expect_r, expect_c] or transposed [expect_c, expect_r].
+        if (m->ne[0] == expect_r && m->ne[1] == expect_c) {
+            return read_scalar(m, r, c);
+        }
+        if (m->ne[0] == expect_c && m->ne[1] == expect_r) {
+            return read_scalar(m, c, r);
+        }
+        return 0.0f;
+    };
+
+    auto vec_get = [&](const ggml_tensor* v, int i) -> float {
+        if (!v) {
+            return 0.0f;
+        }
+        if (v->ne[0] > i) {
+            return read_scalar(v, i, 0);
+        }
+        return 0.0f;
+    };
+
+    auto sigmoidf = [](float z) -> float {
+        if (z >= 0.0f) {
+            const float e = std::exp(-z);
+            return 1.0f / (1.0f + e);
+        }
+        const float e = std::exp(z);
+        return e / (1.0f + e);
+    };
+
+    auto run_dir = [&](const ggml_tensor* w_ih,
+                       const ggml_tensor* w_hh,
+                       const ggml_tensor* b_ih,
+                       const ggml_tensor* b_hh,
+                       bool reverse) -> std::vector<float> {
+        std::vector<float> out(static_cast<size_t>(h_dim) * seq_len, 0.0f);
+        std::vector<float> h(static_cast<size_t>(h_dim), 0.0f);
+        std::vector<float> c(static_cast<size_t>(h_dim), 0.0f);
+        std::vector<float> gates(static_cast<size_t>(4 * h_dim), 0.0f);
+
+        for (int step = 0; step < seq_len; ++step) {
+            const int t = reverse ? (seq_len - 1 - step) : step;
+
+            for (int g = 0; g < 4 * h_dim; ++g) {
+                float v = vec_get(b_ih, g) + vec_get(b_hh, g);
+
+                for (int i = 0; i < in_dim; ++i) {
+                    const float xv = read_scalar(x, i, t);
+                    v += xv * mat_get(w_ih, i, g, in_dim, 4 * h_dim);
+                }
+                for (int i = 0; i < h_dim; ++i) {
+                    v += h[static_cast<size_t>(i)] * mat_get(w_hh, i, g, h_dim, 4 * h_dim);
+                }
+                gates[static_cast<size_t>(g)] = v;
+            }
+
+            for (int i = 0; i < h_dim; ++i) {
+                const float i_t = sigmoidf(gates[static_cast<size_t>(i)]);
+                const float f_t = sigmoidf(gates[static_cast<size_t>(i + h_dim)]);
+                const float g_t = std::tanh(gates[static_cast<size_t>(i + 2 * h_dim)]);
+                const float o_t = sigmoidf(gates[static_cast<size_t>(i + 3 * h_dim)]);
+
+                c[static_cast<size_t>(i)] = f_t * c[static_cast<size_t>(i)] + i_t * g_t;
+                h[static_cast<size_t>(i)] = o_t * std::tanh(c[static_cast<size_t>(i)]);
+                out[static_cast<size_t>(t) * h_dim + static_cast<size_t>(i)] = h[static_cast<size_t>(i)];
+            }
+        }
+        return out;
+    };
+
+    const bool bidir = w.weight_ih_r && w.weight_hh_r;
+    const int out_dim = bidir ? (2 * h_dim) : h_dim;
+
+    std::vector<float> fwd = run_dir(w.weight_ih, w.weight_hh, w.bias_ih, w.bias_hh, false);
+    std::vector<float> bwd;
+    if (bidir) {
+        bwd = run_dir(w.weight_ih_r, w.weight_hh_r, w.bias_ih_r, w.bias_hh_r, true);
+    }
+
+    ggml_tensor* y = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, out_dim, seq_len); // [C, T]
+    float* y_ptr = static_cast<float*>(y->data);
+    for (int t = 0; t < seq_len; ++t) {
+        for (int c_idx = 0; c_idx < h_dim; ++c_idx) {
+            y_ptr[static_cast<size_t>(t) * out_dim + static_cast<size_t>(c_idx)] =
+                fwd[static_cast<size_t>(t) * h_dim + static_cast<size_t>(c_idx)];
+        }
+        if (bidir) {
+            for (int c_idx = 0; c_idx < h_dim; ++c_idx) {
+                y_ptr[static_cast<size_t>(t) * out_dim + static_cast<size_t>(h_dim + c_idx)] =
+                    bwd[static_cast<size_t>(t) * h_dim + static_cast<size_t>(c_idx)];
+            }
+        }
+    }
+    return y;
 }
 
 static ggml_tensor* build_cnn_lstm_encoder(ggml_context* ctx, 
@@ -990,27 +1129,42 @@ static ggml_tensor* build_cnn_lstm_encoder(ggml_context* ctx,
 }
 
 ggml_tensor* Model::build_encoder(ggml_context* ctx, ggml_tensor* hidden) {
-    // If CNN-LSTM weights exist, use them. Otherwise fallback to ALBERT.
-    if (weights_.text_enc_cnn[0].conv_weight_v) {
+    // Duration/prosody path prefers ALBERT when tensor shapes are compatible.
+    const bool has_albert = weights_.albert_layer.q_weight && weights_.albert_layer.ffn_weight;
+    const bool proj_ok = weights_.bert_proj_weight && (weights_.bert_proj_weight->ne[0] == hidden->ne[0]);
+    const int64_t mapped_dim = proj_ok ? weights_.bert_proj_weight->ne[1] : hidden->ne[0];
+    const bool attn_ok = has_albert &&
+                         weights_.albert_layer.q_weight &&
+                         (weights_.albert_layer.q_weight->ne[0] == mapped_dim);
+
+    const bool use_albert = has_albert && proj_ok && attn_ok;
+    if (!use_albert && weights_.text_enc_cnn[0].conv_weight_v) {
         if (heartbeat_verbose()) {
-            std::cerr << "DEBUG: Using CNN-LSTM Text Encoder Path\n";
+            std::cerr << "DEBUG: Using CNN-LSTM fallback for duration path (ALBERT shape mismatch or missing).\n";
         }
         return build_cnn_lstm_encoder(ctx, hidden, weights_);
     }
-    
+
     if (heartbeat_verbose()) {
-        std::cerr << "DEBUG: Using ALBERT Transformer Text Encoder Path\n";
+        if (use_albert) {
+            std::cerr << "DEBUG: Using ALBERT Duration Encoder Path\n";
+        } else {
+            std::cerr << "DEBUG: Using minimal projection-only duration path\n";
+        }
     }
-    if (weights_.bert_proj_weight) {
+
+    if (use_albert && weights_.bert_proj_weight) {
         hidden = ggml_mul_mat(ctx, weights_.bert_proj_weight, hidden);
         if (weights_.bert_proj_bias) {
             hidden = ggml_add(ctx, hidden, weights_.bert_proj_bias);
         }
     }
     
-    for (int i = 0; i < 12; i++) {
-        hidden = build_attention(ctx, hidden, weights_.albert_layer);
-        hidden = build_ffn(ctx, hidden, weights_.albert_layer);
+    if (use_albert) {
+        for (int i = 0; i < 12; i++) {
+            hidden = build_attention(ctx, hidden, weights_.albert_layer);
+            hidden = build_ffn(ctx, hidden, weights_.albert_layer);
+        }
     }
     
     // Project to Predictor Dimension (768 -> 512)
@@ -1060,18 +1214,9 @@ ggml_tensor* Model::build_duration_predictor(ggml_context* ctx,
             x = predictor_lstm_forward(ctx, x, style_rep, weights_.predictor.text_encoder[i].lstm);
         }
         
-        // 2. Linear (1, 3, 5)
+        // 2. Style-conditioned LayerNorm block (DurationEncoder AdaLayerNorm)
         if (weights_.predictor.text_encoder[i].linear.weight) {
-            // Linear layers in predictor also appear to take [Style]?
-            // Usually not, but if weight ne[0] is 640, then it does.
-            // In our discovery, they were 128 elements?
-            // Let's check linear weight dimension and only project if it matches.
-            ggml_tensor* w_lin = weights_.predictor.text_encoder[i].linear.weight;
-            if (w_lin->ne[0] == x->ne[0]) {
-                x = linear_forward(ctx, x, weights_.predictor.text_encoder[i].linear);
-            } else {
-                std::cerr << "WARNING: Skipping Linear layer " << 2*i+1 << " due to mismatch: " << w_lin->ne[0] << " vs " << x->ne[0] << "\n";
-            }
+            x = style_layer_norm(ctx, x, style, weights_.predictor.text_encoder[i].linear);
         }
     }
     
@@ -1242,41 +1387,57 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     if (verbose) {
         std::cerr << "DEBUG: Building Embeddings...\n";
     }
-    // 5. Build Embeddings
-    ggml_tensor* hidden = build_embeddings(ctx0, tokens); // [seq, 128 or 256]
+    // 5. Build shared token embeddings.
+    ggml_tensor* embeddings = build_embeddings(ctx0, tokens); // [seq, D]
     
     // DEBUG: Compute Embeddings
     if (verbose) {
         std::cerr << "DEBUG: Computing Embeddings Graph...\n";
         struct ggml_cgraph* gf_1 = ggml_new_graph(ctx0);
-        ggml_build_forward_expand(gf_1, hidden);
+        ggml_build_forward_expand(gf_1, embeddings);
         ggml_graph_compute_with_ctx(ctx0, gf_1, n_threads);
         
-        float* d = (float*)hidden->data;
+        float* d = (float*)embeddings->data;
         std::cerr << "DEBUG: Embeddings [0]=" << d[0] << " is_nan=" << std::isnan(d[0]) << "\n";
     }
 
     if (verbose) {
-        std::cerr << "DEBUG: Building Encoder...\n";
+        std::cerr << "DEBUG: Building Duration Encoder...\n";
     }
-    hidden = build_encoder(ctx0, hidden); // [768, seq]
+    ggml_tensor* hidden_dur = build_encoder(ctx0, embeddings); // [512, seq] expected
     
-    // DEBUG: Compute Encoder
+    // DEBUG: Compute duration encoder
     if (verbose) {
-        std::cerr << "DEBUG: Computing Encoder Graph...\n";
+        std::cerr << "DEBUG: Computing Duration Encoder Graph...\n";
         struct ggml_cgraph* gf_2 = ggml_new_graph(ctx0);
-        ggml_build_forward_expand(gf_2, hidden);
+        ggml_build_forward_expand(gf_2, hidden_dur);
         ggml_graph_compute_with_ctx(ctx0, gf_2, n_threads);
         
-        float* d = (float*)hidden->data;
-        std::cerr << "DEBUG: Encoder [0]=" << d[0] << " is_nan=" << std::isnan(d[0]) << "\n";
+        float* d = (float*)hidden_dur->data;
+        std::cerr << "DEBUG: Duration Encoder [0]=" << d[0] << " is_nan=" << std::isnan(d[0]) << "\n";
+    }
+
+    // ASR stream for decoder follows text_encoder CNN+LSTM path.
+    ggml_tensor* hidden_asr = hidden_dur;
+    if (weights_.text_enc_cnn[0].conv_weight_v) {
+        if (verbose) {
+            std::cerr << "DEBUG: Building ASR Text Encoder (CNN-LSTM)...\n";
+        }
+        hidden_asr = build_cnn_lstm_encoder(ctx0, embeddings, weights_);
+        if (verbose) {
+            struct ggml_cgraph* gf_asr = ggml_new_graph(ctx0);
+            ggml_build_forward_expand(gf_asr, hidden_asr);
+            ggml_graph_compute_with_ctx(ctx0, gf_asr, n_threads);
+            float* d = (float*)hidden_asr->data;
+            std::cerr << "DEBUG: ASR Encoder [0]=" << d[0] << " is_nan=" << std::isnan(d[0]) << "\n";
+        }
     }
     
     // 7. Predict Durations
     if (verbose) {
         std::cerr << "DEBUG: Building Duration Predictor...\n";
     }
-    ggml_tensor* log_duration = build_duration_predictor(ctx0, hidden, style_tensor_pred);
+    ggml_tensor* log_duration = build_duration_predictor(ctx0, hidden_dur, style_tensor_pred);
     
     // DEBUG: Compute Durations
     if (verbose) {
@@ -1376,7 +1537,7 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     }
     
     // 9. Up-sample Hidden States (CPU Side)
-    // hidden is [512, seq_len]
+    // hidden_dur/hidden_asr are [C, seq_len]
     // durations is vector<int> size seq_len
     
     // Create new tensor input for decoder
@@ -1388,14 +1549,19 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     // Create decoder input in GGML's native [Length, Channels, Batch] layout
     // ggml_new_tensor_3d args: (ctx, type, ne0, ne1, ne2)
     // For [L, C, N]: ne0=L, ne1=C, ne2=N
-    ggml_tensor* dec_input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, total_frames, 512);
+    const int target_hidden_dim = 512;
+    ggml_tensor* dur_input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, total_frames, target_hidden_dim);
+    ggml_tensor* dec_input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, total_frames, target_hidden_dim);
     
     // Safety check: total_frames > 0
     if (total_frames <= 0) total_frames = 1;
     
-    float* src_ptr = (float*)hidden->data;
-    float* dst_ptr = (float*)dec_input->data;
-    int hidden_dim = 512; 
+    float* src_ptr_dur = (float*)hidden_dur->data;
+    float* src_ptr_asr = (float*)hidden_asr->data;
+    float* dst_ptr_dur = (float*)dur_input->data;
+    float* dst_ptr_asr = (float*)dec_input->data;
+    const int hidden_dim_dur = static_cast<int>(hidden_dur->ne[0]);
+    const int hidden_dim_asr = static_cast<int>(hidden_asr->ne[0]);
     
     // Upsample: for each phoneme, repeat its hidden state 'duration' times
     // Layout: [total_frames, 512] stored as rows
@@ -1405,21 +1571,22 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     for (int i = 0; i < expand_tokens && current_frame < total_frames; i++) { 
         int d = durations[i];
         if (d > 0) {
-            float* s = src_ptr + i * hidden_dim;
+            float* s_dur = src_ptr_dur + i * hidden_dim_dur;
+            float* s_asr = src_ptr_asr + i * hidden_dim_asr;
             for (int k = 0; k < d && current_frame < total_frames; k++) {
-                // Copy 512 channels for this frame  
-                // GGML stores [L, C] as L rows of C elements
-                // Frame k is at offset k*512
-                 std::memcpy(dst_ptr + current_frame * hidden_dim, 
-                             s, 
-                             hidden_dim * sizeof(float));
-                 current_frame++;
+                float* out_dur = dst_ptr_dur + current_frame * target_hidden_dim;
+                float* out_asr = dst_ptr_asr + current_frame * target_hidden_dim;
+                std::memset(out_dur, 0, static_cast<size_t>(target_hidden_dim) * sizeof(float));
+                std::memset(out_asr, 0, static_cast<size_t>(target_hidden_dim) * sizeof(float));
+                std::memcpy(out_dur, s_dur, static_cast<size_t>(std::min(target_hidden_dim, hidden_dim_dur)) * sizeof(float));
+                std::memcpy(out_asr, s_asr, static_cast<size_t>(std::min(target_hidden_dim, hidden_dim_asr)) * sizeof(float));
+                current_frame++;
             }
         }
     }
     
     // 10. Build F0/N predictor curves from aligned encoder frames.
-    ggml_tensor* en_aligned = ggml_cont(ctx0, ggml_transpose(ctx0, dec_input)); // [512, T]
+    ggml_tensor* en_aligned = ggml_cont(ctx0, ggml_transpose(ctx0, dur_input)); // [512, T]
     ggml_tensor* f0_curve = build_f0n_curve_predictor(
         ctx0,
         en_aligned,
@@ -1461,7 +1628,7 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         if (verbose) {
             std::cerr << "DEBUG: Computing Decoder (High VRAM usage)...\n";
         }
-        struct ggml_cgraph* gf_dec = ggml_new_graph_custom(ctx0, 32768, false);
+        struct ggml_cgraph* gf_dec = ggml_new_graph_custom(ctx0, 65536, false);
         ggml_build_forward_expand(gf_dec, audio_tensor);
         ggml_graph_compute_with_ctx(ctx0, gf_dec, n_threads);
         if (verbose) {
@@ -1710,6 +1877,16 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
     }
 
     // Generator stage (keeps logits, ISTFT happens in forward()).
+    // Build a lightweight F0-derived conditioning tensor for noise branches.
+    const int generator_scale = 10 * 6;
+    const int cond_channels = std::max(2, params_.istft_n_fft + 2);
+    ggml_tensor* har_base = upsample_nearest(ctx, f0_3d, generator_scale); // [T*60, 1, 1]
+    ggml_tensor* har = nullptr;
+    if (har_base) {
+        ggml_tensor* har_tgt = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, har_base->ne[0], cond_channels, 1);
+        har = ggml_repeat(ctx, har_base, har_tgt); // [T*60, 22, 1]
+    }
+
     static constexpr int kUpsampleRates[2] = {10, 6};
     for (int i = 0; i < 2; i++) {
         x = ggml_leaky_relu(ctx, x, 0.1f, true);
@@ -1731,7 +1908,30 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
             x = crop_time_length(ctx, x, in_len * stride);
         }
 
-        if (weights_.generator.noise_res[i].convs1[0].weight_v) {
+        ggml_tensor* x_source = nullptr;
+        if (har && weights_.generator.noise_convs_weight[i]) {
+            int src_stride = 1;
+            for (int r = i + 1; r < 2; r++) {
+                src_stride *= kUpsampleRates[r];
+            }
+            const int src_padding = (i + 1 < 2) ? ((src_stride + 1) / 2) : 0;
+
+            x_source = plain_conv1d(ctx,
+                                    har,
+                                    weights_.generator.noise_convs_weight[i],
+                                    weights_.generator.noise_convs_bias[i],
+                                    src_stride,
+                                    src_padding,
+                                    1);
+            if (x_source && weights_.generator.noise_res[i].convs1[0].weight_v) {
+                x_source = build_resblock_impl(ctx, x_source, style, weights_.generator.noise_res[i]);
+            }
+            if (x_source) {
+                x_source = fit_len(x_source, x->ne[0]);
+                x = ggml_add(ctx, x, x_source);
+            }
+        } else if (weights_.generator.noise_res[i].convs1[0].weight_v) {
+            // Fallback when source conv weights are unavailable.
             x = build_resblock_impl(ctx, x, style, weights_.generator.noise_res[i]);
         }
 
