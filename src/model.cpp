@@ -784,13 +784,10 @@ static ggml_tensor* build_adainresblk1d(ggml_context* ctx, ggml_tensor* x, ggml_
     
     if (upsample) {
         // Reference uses depthwise ConvTranspose1d(k=3, s=2, groups=dim, p=1, output_padding=1)
-        if (w.pool.weight_v) {
-            res = weight_norm_conv_transpose_1d(ctx, res, w.pool.weight_g, w.pool.weight_v, w.pool.bias, 2, 0, 1);
-            res = crop_time_length(ctx, res, target_len);
-        } else {
-            res = upsample_nearest_2x(ctx, res);
-            res = crop_time_length(ctx, res, target_len);
-        }
+        // GGML doesn't support grouped convolutions, so pool weights [K,1,C] can't be used directly.
+        // Fall back to nearest-neighbor upsampling.
+        res = upsample_nearest_2x(ctx, res);
+        res = crop_time_length(ctx, res, target_len);
     }
     
     res = weight_norm_conv1d(ctx, res, w.conv1.weight_g, w.conv1.weight_v, w.conv1.bias, 1, 1, 1);
