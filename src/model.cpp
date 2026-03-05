@@ -112,8 +112,7 @@ bool Model::load_weights(GGUFLoader& loader) {
     // Store reference to loader for direct tensor access during forward pass
     loader_ = &loader;
     
-    // Verify manual lookup (removed debug loop)
-    // Use identified tensor name: "bert_encoder.weight"
+    // BERT-to-predictor projection (bert_encoder in reference).
     weights_.text_enc_proj_weight = loader.get_tensor("bert_encoder.weight");
     weights_.text_enc_proj_bias = loader.get_tensor("bert_encoder.bias");
     
@@ -121,8 +120,6 @@ bool Model::load_weights(GGUFLoader& loader) {
         if (weights_.text_enc_proj_weight) std::cerr << "DEBUG: SUCCESS loading text_enc_proj (bert_encoder)\n";
         else std::cerr << "DEBUG: FAILED loading text_enc_proj (bert_encoder)\n";
     }
-    
-    // Helper to get tensor with fallback name patterns
     
     // Helper to get tensor with fallback name patterns
     auto get_tensor = [&loader](const std::vector<std::string>& names) -> ggml_tensor* {
@@ -211,9 +208,11 @@ bool Model::load_weights(GGUFLoader& loader) {
     // BERT Text Encoder (ALBERT-style)
     // ========================================
     
-    // BERT Embeddings (shared for    // word_embeddings
+    // BERT Embeddings — the GGUF export maps bert.embeddings.word_embeddings to
+    // "text_encoder.emb.weight". The other tensor "text_encoder.embedding.weight"
+    // belongs to the separate ASR Text Encoder (different dim!).
     weights_.word_embeddings = get_tensor({
-        "text_encoder.embedding.weight", 
+        "text_encoder.emb.weight",
         "bert.embeddings.word_embeddings.weight"
     });
     
@@ -480,10 +479,20 @@ bool Model::load_weights(GGUFLoader& loader) {
         "bm_george", "bm_daniel",
         "if_sara", "im_nicola",
     };
+    // Try multiple path prefixes so voice packs are found regardless of CWD.
+    const std::vector<std::string> voice_prefixes = {
+        "models/voices/",
+        "../models/voices/",
+        "../../models/voices/",
+        "../../../models/voices/",
+    };
     for (const auto& name : voice_files) {
-        const std::string path = "models/voices/" + name + ".hvp";
-        if (load_voice_pack(name, path)) {
-            loaded_voice_packs++;
+        for (const auto& prefix : voice_prefixes) {
+            const std::string path = prefix + name + ".hvp";
+            if (load_voice_pack(name, path)) {
+                loaded_voice_packs++;
+                break;
+            }
         }
     }
     
@@ -1202,44 +1211,57 @@ static ggml_tensor* predictor_lstm_forward(ggml_context* ctx,
 
 ggml_tensor* Model::build_duration_predictor(ggml_context* ctx, 
                                              ggml_tensor* hidden, 
-                                             ggml_tensor* style) {
+                                             ggml_tensor* style,
+                                             ggml_tensor** d_enc_out) {
     int seq_len = (int)hidden->ne[1];
     int style_dim = (int)style->ne[0];
     
-    // Broadcast style
+    // Broadcast style to [style_dim, seq_len]
     ggml_tensor* style_rep = ggml_repeat(ctx, style, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, style_dim, seq_len));
 
     ggml_tensor* x = hidden; // [512, Seq]
     
-    // 3 Blocks of (Predictor LSTM + Linear)
+    // === DurationEncoder: 3 Blocks of (BiLSTM + AdaLayerNorm) ===
+    // Reference: predictor.text_encoder(d_en, s, input_lengths, text_mask)
+    // Each block:
+    //   1. Concat style → LSTM input [640, Seq]
+    //   2. BiLSTM → [512, Seq]
+    //   3. AdaLayerNorm(x, style) → [512, Seq]
     for (int i = 0; i < 3; i++) {
-        // 1. LSTM (0, 2, 4)
+        // 1. LSTM (concats style internally via predictor_lstm_forward)
         if (weights_.predictor.text_encoder[i].lstm.weight_ih) {
             x = predictor_lstm_forward(ctx, x, style_rep, weights_.predictor.text_encoder[i].lstm);
         }
         
-        // 2. Style-conditioned LayerNorm block (DurationEncoder AdaLayerNorm)
+        // 2. Style-conditioned LayerNorm (AdaLayerNorm in reference)
         if (weights_.predictor.text_encoder[i].linear.weight) {
             x = style_layer_norm(ctx, x, style, weights_.predictor.text_encoder[i].linear);
         }
     }
     
-    // Shared LSTM
-    if (weights_.predictor.shared_lstm.weight_ih) {
-        x = predictor_lstm_forward(ctx, x, style_rep, weights_.predictor.shared_lstm);
+    // Re-concat style after DurationEncoder to produce 640-dim output
+    // (reference: last AdaLayerNorm re-concatenates style before return)
+    ggml_tensor* d_enc = ggml_concat(ctx, x, style_rep, 0); // [640, Seq]
+    
+    if (d_enc_out) {
+        *d_enc_out = d_enc;
     }
     
-    // Duration LSTM
+    // === Duration LSTM ===
+    // Reference: x, _ = self.predictor.lstm(d)
+    // Takes 640-dim directly (style is already included from DurationEncoder output)
+    ggml_tensor* dur = d_enc;
     if (weights_.predictor.duration_lstm.weight_ih) {
-        x = predictor_lstm_forward(ctx, x, style_rep, weights_.predictor.duration_lstm);
+        dur = lstm_forward(ctx, d_enc, weights_.predictor.duration_lstm);
     }
     
-    // Final Projection to Duration
+    // === Duration Projection ===
+    // Reference: duration = self.predictor.duration_proj(x)
     if (weights_.predictor.duration_proj.weight) {
-        x = linear_forward(ctx, x, weights_.predictor.duration_proj);
+        dur = linear_forward(ctx, dur, weights_.predictor.duration_proj);
     }
     
-    return x;
+    return dur;
 }
 
 static ggml_tensor* project_curve_from_channels(ggml_context* ctx,
@@ -1287,24 +1309,16 @@ static ggml_tensor* project_curve_from_channels(ggml_context* ctx,
 }
 
 static ggml_tensor* build_f0n_curve_predictor(ggml_context* ctx,
-                                              ggml_tensor* en,
+                                              ggml_tensor* shared_out,
                                               ggml_tensor* style,
-                                              const PredictorWeights& predictor,
                                               const std::array<AdainResBlk1dWeights, 3>& blocks,
                                               const LinearWeights& proj) {
-    if (!en) {
+    if (!shared_out) {
         return nullptr;
     }
 
-    ggml_tensor* x = en; // [C, L]
-    if (style && predictor.shared_lstm.weight_ih) {
-        const int seq_len = static_cast<int>(x->ne[1]);
-        const int style_dim = static_cast<int>(style->ne[0]);
-        ggml_tensor* style_rep = ggml_repeat(ctx, style, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, style_dim, seq_len));
-        x = predictor_lstm_forward(ctx, x, style_rep, predictor.shared_lstm);
-    }
-
-    ggml_tensor* x_lc = ggml_cont(ctx, ggml_transpose(ctx, x));              // [L, C]
+    // shared_out: [C, L] — already processed by shared LSTM
+    ggml_tensor* x_lc = ggml_cont(ctx, ggml_transpose(ctx, shared_out));          // [L, C]
     ggml_tensor* h = ggml_reshape_3d(ctx, x_lc, x_lc->ne[0], x_lc->ne[1], 1); // [L, C, 1]
 
     for (int i = 0; i < 3; i++) {
@@ -1421,13 +1435,22 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         std::cerr << "DEBUG: Duration Encoder [0]=" << d[0] << " is_nan=" << std::isnan(d[0]) << "\n";
     }
 
-    // ASR stream for decoder follows text_encoder CNN+LSTM path.
+    // ASR stream: uses separate TextEncoder (own embedding + CNN + BiLSTM)
+    // Reference: t_en = self.text_encoder(input_ids, input_lengths, text_mask)
     ggml_tensor* hidden_asr = hidden_dur;
     if (weights_.text_enc_cnn[0].conv_weight_v) {
+        ggml_tensor* asr_emb = embeddings;
+        // TextEncoder has its own embedding table (text_encoder.embedding.weight, 512-dim)
+        // distinct from BERT embeddings (text_encoder.emb.weight, 128-dim).
+        if (weights_.text_enc_embedding) {
+            ggml_tensor* asr_ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, seq_len);
+            std::memcpy(asr_ids->data, tokens.data(), static_cast<size_t>(seq_len) * sizeof(int));
+            asr_emb = ggml_get_rows(ctx0, weights_.text_enc_embedding, asr_ids);
+        }
         if (verbose) {
             std::cerr << "DEBUG: Building ASR Text Encoder (CNN-LSTM)...\n";
         }
-        hidden_asr = build_cnn_lstm_encoder(ctx0, embeddings, weights_);
+        hidden_asr = build_cnn_lstm_encoder(ctx0, asr_emb, weights_);
         if (verbose) {
             struct ggml_cgraph* gf_asr = ggml_new_graph(ctx0);
             ggml_build_forward_expand(gf_asr, hidden_asr);
@@ -1437,11 +1460,12 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         }
     }
     
-    // 7. Predict Durations
+    // 7. Predict Durations (captures DurationEncoder output for F0/N path)
     if (verbose) {
         std::cerr << "DEBUG: Building Duration Predictor...\n";
     }
-    ggml_tensor* log_duration = build_duration_predictor(ctx0, hidden_dur, style_tensor_pred);
+    ggml_tensor* d_enc = nullptr;
+    ggml_tensor* log_duration = build_duration_predictor(ctx0, hidden_dur, style_tensor_pred, &d_enc);
     
     // DEBUG: Compute Durations
     if (verbose) {
@@ -1528,6 +1552,20 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         durations.push_back(1);
         total_frames += 1;
     }
+
+    // Calibration: keep average token duration from collapsing too low.
+    if (token_count > 0) {
+        const int min_avg = heartbeat_min_avg_token_frames();
+        const float avg = static_cast<float>(total_frames) / static_cast<float>(token_count);
+        if (avg < static_cast<float>(min_avg) && avg > 0.0f) {
+            const float scale = static_cast<float>(min_avg) / avg;
+            total_frames = 0;
+            for (int& d : durations) {
+                d = std::max(1, std::min(max_token_frames, static_cast<int>(std::round(d * scale))));
+                total_frames += d;
+            }
+        }
+    }
     
     // Safety cap for total frames (protect decoder memory usage).
     const int max_total_frames = heartbeat_max_total_frames();
@@ -1540,70 +1578,82 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         std::cerr << "DEBUG: Predicted total frames: " << total_frames << "\n";
     }
     
-    // 9. Up-sample Hidden States (CPU Side)
-    // hidden_dur/hidden_asr are [C, seq_len]
-    // durations is vector<int> size seq_len
-    
-    // Create new tensor input for decoder
-    // size [512, total_frames]
+    // 9. Up-sample hidden states (CPU side)
+    //
+    // Reference flow:
+    //   en    = d.transpose(-1,-2) @ pred_aln_trg   — for F0/N predictor
+    //   asr   = t_en @ pred_aln_trg                  — for decoder
+    //
+    // d_enc:      DurationEncoder output [640, seq]   (includes style concat)
+    // hidden_asr: TextEncoder output     [512, seq]
     
     if (verbose) {
         std::cerr << "DEBUG: Upsampling hidden states to " << total_frames << " frames...\n";
     }
-    // Create decoder input in GGML's native [Length, Channels, Batch] layout
-    // ggml_new_tensor_3d args: (ctx, type, ne0, ne1, ne2)
-    // For [L, C, N]: ne0=L, ne1=C, ne2=N
+    
     const int target_hidden_dim = 512;
-    ggml_tensor* dur_input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, total_frames, target_hidden_dim);
+    const int d_enc_dim = d_enc ? static_cast<int>(d_enc->ne[0]) : target_hidden_dim;
+    
+    // en_input: duration-expanded DurationEncoder features for F0/N
+    ggml_tensor* en_input  = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, total_frames, d_enc_dim);
+    // dec_input: duration-expanded ASR features for decoder
     ggml_tensor* dec_input = ggml_new_tensor_2d(ctx0, GGML_TYPE_F32, total_frames, target_hidden_dim);
     
-    // Safety check: total_frames > 0
-    if (total_frames <= 0) total_frames = 1;
-    
-    float* src_ptr_dur = (float*)hidden_dur->data;
-    float* src_ptr_asr = (float*)hidden_asr->data;
-    float* dst_ptr_dur = (float*)dur_input->data;
-    float* dst_ptr_asr = (float*)dec_input->data;
-    const int hidden_dim_dur = static_cast<int>(hidden_dur->ne[0]);
-    const int hidden_dim_asr = static_cast<int>(hidden_asr->ne[0]);
-    
-    // Upsample: for each phoneme, repeat its hidden state 'duration' times
-    // Layout: [total_frames, 512] stored as rows
-    // Each row is one frame with 512 channels
-    int current_frame =0;
-    const int expand_tokens = std::min(seq_len, static_cast<int>(durations.size()));
-    for (int i = 0; i < expand_tokens && current_frame < total_frames; i++) { 
-        int d = durations[i];
-        if (d > 0) {
-            float* s_dur = src_ptr_dur + i * hidden_dim_dur;
-            float* s_asr = src_ptr_asr + i * hidden_dim_asr;
-            for (int k = 0; k < d && current_frame < total_frames; k++) {
-                float* out_dur = dst_ptr_dur + current_frame * target_hidden_dim;
-                float* out_asr = dst_ptr_asr + current_frame * target_hidden_dim;
-                std::memset(out_dur, 0, static_cast<size_t>(target_hidden_dim) * sizeof(float));
-                std::memset(out_asr, 0, static_cast<size_t>(target_hidden_dim) * sizeof(float));
-                std::memcpy(out_dur, s_dur, static_cast<size_t>(std::min(target_hidden_dim, hidden_dim_dur)) * sizeof(float));
-                std::memcpy(out_asr, s_asr, static_cast<size_t>(std::min(target_hidden_dim, hidden_dim_asr)) * sizeof(float));
-                current_frame++;
+    {
+        float* src_ptr_enc = d_enc ? (float*)d_enc->data : (float*)hidden_dur->data;
+        float* src_ptr_asr = (float*)hidden_asr->data;
+        float* dst_ptr_enc = (float*)en_input->data;
+        float* dst_ptr_asr = (float*)dec_input->data;
+        const int src_dim_enc = d_enc ? static_cast<int>(d_enc->ne[0]) : static_cast<int>(hidden_dur->ne[0]);
+        const int src_dim_asr = static_cast<int>(hidden_asr->ne[0]);
+        
+        int current_frame = 0;
+        const int expand_tokens = std::min(seq_len, static_cast<int>(durations.size()));
+        for (int i = 0; i < expand_tokens && current_frame < total_frames; i++) {
+            int dur = durations[i];
+            if (dur > 0) {
+                float* s_enc = src_ptr_enc + i * src_dim_enc;
+                float* s_asr = src_ptr_asr + i * src_dim_asr;
+                for (int k = 0; k < dur && current_frame < total_frames; k++) {
+                    float* out_enc = dst_ptr_enc + current_frame * d_enc_dim;
+                    float* out_asr = dst_ptr_asr + current_frame * target_hidden_dim;
+                    std::memset(out_enc, 0, static_cast<size_t>(d_enc_dim) * sizeof(float));
+                    std::memset(out_asr, 0, static_cast<size_t>(target_hidden_dim) * sizeof(float));
+                    std::memcpy(out_enc, s_enc, static_cast<size_t>(std::min(d_enc_dim, src_dim_enc)) * sizeof(float));
+                    std::memcpy(out_asr, s_asr, static_cast<size_t>(std::min(target_hidden_dim, src_dim_asr)) * sizeof(float));
+                    current_frame++;
+                }
             }
         }
     }
     
-    // 10. Build F0/N predictor curves from aligned encoder frames.
-    ggml_tensor* en_aligned = ggml_cont(ctx0, ggml_transpose(ctx0, dur_input)); // [512, T]
+    // 10. Build F0/N predictor curves.
+    //
+    // Reference:
+    //   en = d.T @ pred_aln_trg          — [640, frames]
+    //   x, _ = predictor.shared(en.T)    — shared LSTM (called ONCE)
+    //   F0 = F0_blocks(x, s)
+    //   N  = N_blocks(x, s)
+    
+    ggml_tensor* en_aligned = ggml_cont(ctx0, ggml_transpose(ctx0, en_input)); // [d_enc_dim, total_frames]
+    
+    // Shared LSTM — called once, output feeds both F0 and N branches.
+    ggml_tensor* shared_out = en_aligned;
+    if (weights_.predictor.shared_lstm.weight_ih) {
+        shared_out = lstm_forward(ctx0, en_aligned, weights_.predictor.shared_lstm);
+    }
+    
     ggml_tensor* f0_curve = build_f0n_curve_predictor(
         ctx0,
-        en_aligned,
+        shared_out,
         style_tensor_pred,
-        weights_.predictor,
         weights_.predictor.F0,
         weights_.predictor.F0_proj
     );
     ggml_tensor* n_curve = build_f0n_curve_predictor(
         ctx0,
-        en_aligned,
+        shared_out,
         style_tensor_pred,
-        weights_.predictor,
         weights_.predictor.N,
         weights_.predictor.N_proj
     );
