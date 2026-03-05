@@ -11,6 +11,7 @@
  */
 
 #include "model.h"
+#include "dsp.h"
 
 #include <cmath>
 #include <algorithm>
@@ -20,6 +21,8 @@
 #include <cstdlib>
 #include <thread>
 #include <fstream>
+#include <numeric>
+#include <random>
 
 extern "C" {
 #include "ggml.h"
@@ -78,6 +81,194 @@ static int heartbeat_max_total_frames() {
 
 static int heartbeat_min_avg_token_frames() {
     return heartbeat_parse_env_int("HEARTBEAT_MIN_AVG_TOKEN_FRAMES", 4, 1, 20);
+}
+
+// --------------------------------------------------------------------------
+// Harmonic source generation (SineGen + forward STFT)
+//
+// Reimplements the Python SourceModuleHnNSF + TorchSTFT.transform in pure C++.
+// Called on CPU after f0_curve has been evaluated, before the decoder graph.
+// --------------------------------------------------------------------------
+static std::vector<float> compute_harmonic_source(
+        const float* f0_data,        // raw F0 curve [f0_len]
+        int f0_len,                  // length of f0_curve (== 2 * n_frames)
+        int sample_rate,             // 24000
+        int upsample_scale,          // prod(upsample_rates) * hop_size = 300
+        int harmonic_num,            // 8  (9 harmonics total)
+        float sine_amp,              // 0.1
+        float noise_std,             // 0.003
+        float voiced_threshold,      // 10.0
+        const float* linear_weight,  // m_source l_linear weight [1, harmonic_num+1]
+        const float* linear_bias,    // m_source l_linear bias [1]
+        int n_fft,                   // gen_istft_n_fft = 20
+        int hop_size,                // gen_istft_hop_size = 5
+        int& out_har_time,           // output: number of STFT frames
+        int& out_har_channels)       // output: n_fft + 2
+{
+    const bool verbose = heartbeat_verbose();
+    const int dim = harmonic_num + 1;  // 9
+    const int wav_len = f0_len * upsample_scale;  // total waveform samples
+
+    if (verbose) {
+        std::cerr << "DEBUG SineGen: f0_len=" << f0_len << " upsample=" << upsample_scale
+                  << " wav_len=" << wav_len << " harmonics=" << dim << "\n";
+    }
+
+    // 1. Upsample F0 from f0_len to wav_len using linear interpolation.
+    //    Python: f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)
+    std::vector<float> f0_up(wav_len);
+    if (f0_len <= 1) {
+        float val = f0_len == 1 ? f0_data[0] : 0.0f;
+        std::fill(f0_up.begin(), f0_up.end(), val);
+    } else {
+        for (int i = 0; i < wav_len; i++) {
+            // Map output position to input position (align endpoints like nn.Upsample linear)
+            float src = static_cast<float>(i) * static_cast<float>(f0_len - 1) / static_cast<float>(wav_len - 1);
+            int i0 = static_cast<int>(src);
+            int i1 = std::min(i0 + 1, f0_len - 1);
+            float frac = src - static_cast<float>(i0);
+            f0_up[i] = f0_data[i0] * (1.0f - frac) + f0_data[i1] * frac;
+        }
+    }
+
+    // 2. Generate harmonic F0 values: fn[t][h] = f0_up[t] * (h+1) for h in [0..dim)
+    //    Then generate sine waves using the cumulative-phase approach.
+    //    Python SineGen._f02sine with flag_for_pulse=False:
+    //      rad = (f0 / sr) % 1
+    //      downsample by upsample_scale → linear interp → cumsum → upsample → *2pi → sin
+    //    This anti-aliasing trick smooths the phase. We replicate it.
+
+    const float inv_sr = 1.0f / static_cast<float>(sample_rate);
+    constexpr float TWO_PI = 6.28318530717958647692f;
+
+    // Allocate sine_waves [wav_len, dim]
+    std::vector<float> sine_waves(static_cast<size_t>(wav_len) * dim, 0.0f);
+
+    // Random initial phase for overtones (not fundamental).
+    std::mt19937 rng(42);  // deterministic seed for reproducibility
+    std::uniform_real_distribution<float> rand01(0.0f, 1.0f);
+    std::vector<float> rand_ini(dim, 0.0f);
+    for (int h = 1; h < dim; h++) {
+        rand_ini[h] = rand01(rng);
+    }
+
+    for (int h = 0; h < dim; h++) {
+        const float harmonic_mult = static_cast<float>(h + 1);
+
+        // Compute rad_values = (f0 * harmonic / sr) % 1
+        std::vector<float> rad(wav_len);
+        for (int i = 0; i < wav_len; i++) {
+            float fn = f0_up[i] * harmonic_mult;
+            float r = std::fmod(fn * inv_sr, 1.0f);
+            if (r < 0.0f) r += 1.0f;
+            rad[i] = r;
+        }
+        // Add random initial phase at the first sample
+        rad[0] += rand_ini[h];
+
+        // Downsample by upsample_scale using linear interpolation
+        int down_len = (wav_len + upsample_scale - 1) / upsample_scale;
+        std::vector<float> rad_down(down_len);
+        for (int i = 0; i < down_len; i++) {
+            float src = static_cast<float>(i) * static_cast<float>(wav_len - 1) / static_cast<float>(std::max(1, down_len - 1));
+            int i0 = static_cast<int>(src);
+            int i1 = std::min(i0 + 1, wav_len - 1);
+            float frac = src - static_cast<float>(i0);
+            rad_down[i] = rad[i0] * (1.0f - frac) + rad[i1] * frac;
+        }
+
+        // Cumulative sum of downsampled rad
+        std::vector<float> phase_down(down_len);
+        phase_down[0] = rad_down[0];
+        for (int i = 1; i < down_len; i++) {
+            phase_down[i] = phase_down[i - 1] + rad_down[i];
+        }
+
+        // Upsample phase back to wav_len and multiply by upsample_scale
+        std::vector<float> phase_up(wav_len);
+        for (int i = 0; i < wav_len; i++) {
+            float src = static_cast<float>(i) * static_cast<float>(down_len - 1) / static_cast<float>(std::max(1, wav_len - 1));
+            int i0 = static_cast<int>(src);
+            int i1 = std::min(i0 + 1, down_len - 1);
+            float frac = src - static_cast<float>(i0);
+            phase_up[i] = (phase_down[i0] * (1.0f - frac) + phase_down[i1] * frac) * static_cast<float>(upsample_scale);
+        }
+
+        // sin(2 * pi * phase) * sine_amp
+        for (int i = 0; i < wav_len; i++) {
+            sine_waves[static_cast<size_t>(i) * dim + h] = std::sin(TWO_PI * phase_up[i]) * sine_amp;
+        }
+    }
+
+    // 3. Apply voicing mask: voiced = f0 > threshold, unvoiced gets noise
+    //    uv[t] = (f0_up[t] > voiced_threshold) ? 1 : 0
+    //    sine_waves *= uv; noise = noise_amp * randn; result = sine_waves + noise
+    std::normal_distribution<float> randn(0.0f, 1.0f);
+    for (int i = 0; i < wav_len; i++) {
+        float uv = (f0_up[i] > voiced_threshold) ? 1.0f : 0.0f;
+        float noise_amp_val = uv * noise_std + (1.0f - uv) * (sine_amp / 3.0f);
+        for (int h = 0; h < dim; h++) {
+            float noise = noise_amp_val * randn(rng);
+            sine_waves[static_cast<size_t>(i) * dim + h] = sine_waves[static_cast<size_t>(i) * dim + h] * uv + noise;
+        }
+    }
+
+    // 4. Apply l_linear (merge harmonics): output[t] = tanh(sum(w[h] * sine[t][h]) + bias)
+    //    Python: sine_merge = self.l_tanh(self.l_linear(sine_wavs))  → [B, wav_len, 1]
+    std::vector<float> har_source(wav_len);
+    for (int i = 0; i < wav_len; i++) {
+        float val = linear_bias ? linear_bias[0] : 0.0f;
+        for (int h = 0; h < dim; h++) {
+            val += linear_weight[h] * sine_waves[static_cast<size_t>(i) * dim + h];
+        }
+        har_source[i] = std::tanh(val);
+    }
+
+    if (verbose) {
+        float har_min = *std::min_element(har_source.begin(), har_source.end());
+        float har_max = *std::max_element(har_source.begin(), har_source.end());
+        std::cerr << "DEBUG SineGen: har_source range [" << har_min << ", " << har_max << "]\n";
+    }
+
+    // 5. Forward STFT of har_source → magnitude + phase
+    //    Uses the same n_fft and hop_size as the generator's TorchSTFT.
+    DSPConfig stft_cfg;
+    stft_cfg.n_fft = n_fft;
+    stft_cfg.hop_length = hop_size;
+    stft_cfg.sample_rate = sample_rate;
+    DSP stft_dsp(stft_cfg);
+
+    std::vector<float> har_spec, har_phase;
+    int stft_frames = 0;
+    int stft_bins = stft_dsp.stft(har_source, har_spec, har_phase, stft_frames);
+
+    if (verbose) {
+        std::cerr << "DEBUG SineGen: STFT frames=" << stft_frames << " bins=" << stft_bins << "\n";
+    }
+
+    // 6. Concatenate [har_spec, har_phase] in channel dimension.
+    //    Python har shape: [B, n_fft+2, stft_frames]
+    //    In GGML layout [time, channels, batch]: [stft_frames, n_fft+2, 1]
+    //    channels = stft_bins (= n_fft/2+1) for spec + stft_bins for phase = n_fft+2
+    out_har_time = stft_frames;
+    out_har_channels = stft_bins * 2;  // magnitude + phase = n_fft + 2
+
+    // GGML tensor data is element-contiguous: data[time * channels + channel]
+    std::vector<float> har_data(static_cast<size_t>(stft_frames) * out_har_channels);
+    for (int t = 0; t < stft_frames; t++) {
+        for (int f = 0; f < stft_bins; f++) {
+            har_data[static_cast<size_t>(t) * out_har_channels + f] = har_spec[t * stft_bins + f];
+            har_data[static_cast<size_t>(t) * out_har_channels + stft_bins + f] = har_phase[t * stft_bins + f];
+        }
+    }
+
+    if (verbose) {
+        float hd_min = *std::min_element(har_data.begin(), har_data.end());
+        float hd_max = *std::max_element(har_data.begin(), har_data.end());
+        std::cerr << "DEBUG SineGen: har tensor [" << out_har_time << ", " << out_har_channels << "] range [" << hd_min << ", " << hd_max << "]\n";
+    }
+
+    return har_data;
 }
 
 Model::Model() = default;
@@ -1716,18 +1907,77 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
         }
     }
 
+    // 10b. Compute F0/N curves in a separate graph so we can use f0 values
+    //      on CPU for SineGen harmonic source generation.
+    std::vector<float> har_data;
+    int har_time = 0, har_channels = 0;
+    if (f0_curve) {
+        struct ggml_cgraph* gf_f0 = ggml_new_graph(ctx0);
+        ggml_build_forward_expand(gf_f0, f0_curve);
+        if (n_curve) {
+            ggml_build_forward_expand(gf_f0, n_curve);
+        }
+        ggml_graph_compute_with_ctx(ctx0, gf_f0, n_threads);
+
+        if (verbose) {
+            const float* fd = (const float*)f0_curve->data;
+            int f0_len = static_cast<int>(ggml_nelements(f0_curve));
+            float f0_min = *std::min_element(fd, fd + f0_len);
+            float f0_max = *std::max_element(fd, fd + f0_len);
+            std::cerr << "DEBUG: F0 curve computed: len=" << f0_len
+                      << " range=[" << f0_min << ", " << f0_max << "]\n";
+        }
+
+        // Compute harmonic source from F0 using SineGen + forward STFT.
+        const float* f0_ptr = (const float*)f0_curve->data;
+        int f0_len = static_cast<int>(ggml_nelements(f0_curve));
+
+        // Check that l_linear weights are available.
+        const float* lw = weights_.generator.m_source_linear.weight
+                          ? (const float*)weights_.generator.m_source_linear.weight->data
+                          : nullptr;
+        const float* lb = weights_.generator.m_source_linear.bias
+                          ? (const float*)weights_.generator.m_source_linear.bias->data
+                          : nullptr;
+
+        if (lw) {
+            // Parameters matching Python Generator.__init__:
+            //   SourceModuleHnNSF(sampling_rate=24000,
+            //                     upsample_scale=prod(upsample_rates)*gen_istft_hop_size,
+            //                     harmonic_num=8, voiced_threshod=10)
+            const int upsample_scale = 10 * 6 * params_.istft_hop_length;  // 300
+            har_data = compute_harmonic_source(
+                f0_ptr, f0_len,
+                params_.sample_rate,     // 24000
+                upsample_scale,          // 300
+                8,                       // harmonic_num
+                0.1f,                    // sine_amp
+                0.003f,                  // noise_std
+                10.0f,                   // voiced_threshold
+                lw, lb,
+                params_.istft_n_fft,     // 20
+                params_.istft_hop_length, // 5
+                har_time, har_channels);
+        } else if (verbose) {
+            std::cerr << "DEBUG: m_source l_linear weights not available, skipping SineGen\n";
+        }
+    }
+
     // 11. Build Decoder
     if (verbose) {
         std::cerr << "DEBUG: Building Decoder Graph...\n";
         std::cerr << "DEBUG: dec_input: [" << dec_input->ne[0] << ", " << dec_input->ne[1] << "]\n";
         if (f0_curve) std::cerr << "DEBUG: f0_curve: [" << f0_curve->ne[0] << ", " << f0_curve->ne[1] << ", " << f0_curve->ne[2] << "]\n";
         if (n_curve) std::cerr << "DEBUG: n_curve: [" << n_curve->ne[0] << ", " << n_curve->ne[1] << ", " << n_curve->ne[2] << "]\n";
+        if (!har_data.empty()) std::cerr << "DEBUG: har tensor: [" << har_time << ", " << har_channels << "]\n";
     }
     // dec_input is [hidden_dim, total_frames] (feature-major for correct fill).
     // The decoder's conv1d needs [time, channels, batch], so transpose to
     // [total_frames, hidden_dim] and make contiguous.
     ggml_tensor* dec_input_t = ggml_cont(ctx0, ggml_transpose(ctx0, dec_input));
-    ggml_tensor* audio_tensor = build_decoder(ctx0, dec_input_t, f0_curve, n_curve, style_tensor_dec);
+    ggml_tensor* audio_tensor = build_decoder(ctx0, dec_input_t, f0_curve, n_curve, style_tensor_dec,
+                                              har_data.empty() ? nullptr : har_data.data(),
+                                              har_time, har_channels);
     
     // 12. Compute Decoder
     {
@@ -1881,7 +2131,10 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
                                   ggml_tensor* asr,
                                   ggml_tensor* f0_curve,
                                   ggml_tensor* n_curve,
-                                  ggml_tensor* style) {
+                                  ggml_tensor* style,
+                                  const float* har_data_ptr,
+                                  int har_data_time,
+                                  int har_data_channels) {
     auto to_curve3d = [&](ggml_tensor* t) -> ggml_tensor* {
         if (!t) {
             return nullptr;
@@ -2002,17 +2255,21 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
     }
 
     // Generator stage (keeps logits, ISTFT happens in forward()).
-    // Harmonic source conditioning: The reference Python code generates sine
-    // waves from F0 via SineGen, takes their STFT, and concatenates
-    // magnitude+phase as the "har" tensor.  Implementing SineGen+STFT in pure
-    // GGML is very complex, so we use a zero tensor instead.  This removes the
-    // periodic excitation source but prevents raw F0 values (100-200 Hz as
-    // floats) from corrupting the signal with massive activations.
-    const int generator_scale = 10 * 6; // prod(upsample_rates)
+    // Harmonic source: SineGen + forward STFT, precomputed on CPU and passed in.
     const int cond_channels = std::max(2, params_.istft_n_fft + 2);
-    const int64_t har_time = f0_3d ? f0_3d->ne[0] * generator_scale : t_asr * generator_scale;
-    ggml_tensor* har = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, har_time, cond_channels, 1);
-    ggml_set_zero(har);
+    ggml_tensor* har = nullptr;
+    if (har_data_ptr && har_data_time > 0 && har_data_channels > 0) {
+        // Use precomputed harmonic source from SineGen.
+        har = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, har_data_time, har_data_channels, 1);
+        std::memcpy(har->data, har_data_ptr,
+                     static_cast<size_t>(har_data_time) * har_data_channels * sizeof(float));
+    } else {
+        // Fallback: zero tensor (no harmonic excitation).
+        const int generator_scale = 10 * 6;
+        const int64_t har_time_fallback = f0_3d ? f0_3d->ne[0] * generator_scale : t_asr * generator_scale;
+        har = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, har_time_fallback, cond_channels, 1);
+        ggml_set_zero(har);
+    }
 
     static constexpr int kUpsampleRates[2] = {10, 6};
     for (int i = 0; i < 2; i++) {
