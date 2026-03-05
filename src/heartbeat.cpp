@@ -139,6 +139,18 @@ SynthesisResult Heartbeat::synthesize(const std::string& text,
             if (verbose) std::cerr << "DEBUG: Model output is raw audio, skipping ISTFT\n";
             result.audio = model_out.magnitude;
         } else {
+            // Reconfigure DSP if model detected different ISTFT parameters.
+            // n_mels from model = n_fft/2 + 1, so n_fft = (n_mels - 1) * 2.
+            if (model_out.n_mels > 1) {
+                const int detected_n_fft = (model_out.n_mels - 1) * 2;
+                DSPConfig dsp_config;
+                dsp_config.n_fft = detected_n_fft;
+                dsp_config.hop_length = impl_->loader.params().istft_hop_length;
+                dsp_config.sample_rate = impl_->loader.params().sample_rate;
+                if (verbose) std::cerr << "DEBUG: ISTFT config: n_fft=" << dsp_config.n_fft
+                                       << " hop=" << dsp_config.hop_length << "\n";
+                impl_->dsp = DSP(dsp_config);
+            }
             if (verbose) std::cerr << "DEBUG: Running ISTFT...\n";
             result.audio = impl_->dsp.istft(
                 model_out.magnitude,
