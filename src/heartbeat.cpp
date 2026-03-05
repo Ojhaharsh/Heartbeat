@@ -99,7 +99,15 @@ SynthesisResult Heartbeat::synthesize(const std::string& text,
         ph_config.rate = voice.speed;
         
         std::vector<int> tokens = impl_->phonemizer.text_to_tokens(text, ph_config);
-        if (verbose) std::cerr << "DEBUG: Got " << tokens.size() << " tokens\n";
+        if (verbose) {
+            std::cerr << "DEBUG: Got " << tokens.size() << " tokens\n";
+            std::cerr << "DEBUG: Token IDs: ";
+            for (size_t i = 0; i < std::min<size_t>(tokens.size(), 32); ++i) {
+                std::cerr << tokens[i] << " ";
+            }
+            if (tokens.size() > 32) std::cerr << "...";
+            std::cerr << "\n";
+        }
         
         if (tokens.empty()) {
             result.error_message = "Failed to phonemize text";
