@@ -12,8 +12,8 @@ namespace heartbeat {
  * Audio processing configuration.
  */
 struct DSPConfig {
-    int n_fft = 16;             // FFT size
-    int hop_length = 4;         // Hop length for OLA
+    int n_fft = 20;             // FFT size (Kokoro default: 20)
+    int hop_length = 5;         // Hop length for OLA (Kokoro default: 5)
     int sample_rate = 24000;    // Output sample rate
     float pre_emphasis = 0.0f;  // Pre-emphasis coefficient
 };
