@@ -96,7 +96,7 @@ struct KokoroParams {
     int max_position = 512;
     
     // Style
-    int style_dim = 256;
+    int style_dim = 128;
     int n_styles = 1;
     
     // Decoder
@@ -105,8 +105,8 @@ struct KokoroParams {
     int decoder_layers = 8;
     
     // ISTFT
-    int istft_n_fft = 16;
-    int istft_hop_length = 4;
+    int istft_n_fft = 20;
+    int istft_hop_length = 5;
     
     // Audio
     int sample_rate = 24000;
