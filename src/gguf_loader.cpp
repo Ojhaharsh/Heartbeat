@@ -319,10 +319,10 @@ void GGUFLoader::extract_params() {
     params_.hidden_size = get_int("kokoro.hidden_size", 768);
     params_.num_layers = get_int("kokoro.num_layers", 12);
     params_.num_heads = get_int("kokoro.num_heads", 12);
-    params_.style_dim = get_int("kokoro.style_dim", 256);
+    params_.style_dim = get_int("kokoro.style_dim", 128);
     params_.n_mels = get_int("kokoro.n_mels", 80);
-    params_.istft_n_fft = get_int("kokoro.istft_n_fft", 16);
-    params_.istft_hop_length = get_int("kokoro.istft_hop_length", 4);
+    params_.istft_n_fft = get_int("kokoro.istft_n_fft", 20);
+    params_.istft_hop_length = get_int("kokoro.istft_hop_length", 5);
     params_.sample_rate = get_int("kokoro.sample_rate", 24000);
     
     // Extract vocabulary
