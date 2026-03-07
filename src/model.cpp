@@ -114,20 +114,19 @@ static std::vector<float> compute_harmonic_source(
                   << " wav_len=" << wav_len << " harmonics=" << dim << "\n";
     }
 
-    // 1. Upsample F0 from f0_len to wav_len using linear interpolation.
+    // 1. Upsample F0 from f0_len to wav_len using nearest-neighbor interpolation.
     //    Python: f0 = self.f0_upsamp(f0[:, None]).transpose(1, 2)
+    //    nn.Upsample defaults to mode='nearest'.
     std::vector<float> f0_up(wav_len);
     if (f0_len <= 1) {
         float val = f0_len == 1 ? f0_data[0] : 0.0f;
         std::fill(f0_up.begin(), f0_up.end(), val);
     } else {
         for (int i = 0; i < wav_len; i++) {
-            // Map output position to input position (align endpoints like nn.Upsample linear)
-            float src = static_cast<float>(i) * static_cast<float>(f0_len - 1) / static_cast<float>(wav_len - 1);
-            int i0 = static_cast<int>(src);
-            int i1 = std::min(i0 + 1, f0_len - 1);
-            float frac = src - static_cast<float>(i0);
-            f0_up[i] = f0_data[i0] * (1.0f - frac) + f0_data[i1] * frac;
+            // Nearest-neighbor: matches PyTorch nn.Upsample(mode='nearest')
+            int src_idx = static_cast<int>(static_cast<float>(i) * static_cast<float>(f0_len) / static_cast<float>(wav_len));
+            src_idx = std::min(src_idx, f0_len - 1);
+            f0_up[i] = f0_data[src_idx];
         }
     }
 
@@ -2275,6 +2274,38 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
     for (int i = 0; i < 2; i++) {
         x = ggml_leaky_relu(ctx, x, 0.1f, true);
 
+        // Reference order: noise_convs FIRST, then upsample.
+        // Python Generator.forward:
+        //   x_source = self.noise_convs[i](har)
+        //   x_source = self.noise_res[i](x_source, s)
+        //   x = self.ups[i](x)
+        //   x = x + x_source
+
+        // 1. Compute noise/harmonic source BEFORE upsampling.
+        ggml_tensor* x_source = nullptr;
+        if (har && weights_.generator.noise_convs_weight[i]) {
+            int src_stride = 1;
+            for (int r = i + 1; r < 2; r++) {
+                src_stride *= kUpsampleRates[r];
+            }
+            const int src_padding = (i + 1 < 2) ? ((src_stride + 1) / 2) : 0;
+
+            x_source = plain_conv1d(ctx,
+                                    har,
+                                    weights_.generator.noise_convs_weight[i],
+                                    weights_.generator.noise_convs_bias[i],
+                                    src_stride,
+                                    src_padding,
+                                    1);
+            if (x_source && weights_.generator.noise_res[i].convs1[0].weight_v) {
+                x_source = build_resblock_impl(ctx, x_source, style, weights_.generator.noise_res[i]);
+            }
+        } else if (weights_.generator.noise_res[i].convs1[0].weight_v) {
+            // Fallback when source conv weights are unavailable.
+            x = build_resblock_impl(ctx, x, style, weights_.generator.noise_res[i]);
+        }
+
+        // 2. Upsample x.
         if (weights_.generator.ups[i].weight_v) {
             const int stride = kUpsampleRates[i];
             const int64_t in_len = x->ne[0];
@@ -2304,6 +2335,7 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
             }
         }
 
+        // 3. Reflection pad on last upsample stage.
         // Reference: if i == num_upsamples - 1: x = self.reflection_pad(x)
         // Adds 1 sample of reflection padding on the left (nn.ReflectionPad1d((1, 0)))
         if (i == 1) {
@@ -2311,33 +2343,13 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
             x = ggml_pad_reflect_1d(ctx, x, 1, 0);
         }
 
-        ggml_tensor* x_source = nullptr;
-        if (har && weights_.generator.noise_convs_weight[i]) {
-            int src_stride = 1;
-            for (int r = i + 1; r < 2; r++) {
-                src_stride *= kUpsampleRates[r];
-            }
-            const int src_padding = (i + 1 < 2) ? ((src_stride + 1) / 2) : 0;
-
-            x_source = plain_conv1d(ctx,
-                                    har,
-                                    weights_.generator.noise_convs_weight[i],
-                                    weights_.generator.noise_convs_bias[i],
-                                    src_stride,
-                                    src_padding,
-                                    1);
-            if (x_source && weights_.generator.noise_res[i].convs1[0].weight_v) {
-                x_source = build_resblock_impl(ctx, x_source, style, weights_.generator.noise_res[i]);
-            }
-            if (x_source) {
-                x_source = fit_len(x_source, x->ne[0]);
-                x = ggml_add(ctx, x, x_source);
-            }
-        } else if (weights_.generator.noise_res[i].convs1[0].weight_v) {
-            // Fallback when source conv weights are unavailable.
-            x = build_resblock_impl(ctx, x, style, weights_.generator.noise_res[i]);
+        // 4. Add noise/harmonic source to upsampled x.
+        if (x_source) {
+            x_source = fit_len(x_source, x->ne[0]);
+            x = ggml_add(ctx, x, x_source);
         }
 
+        // 5. Multi-receptive field fusion (MRF) resblocks.
         ggml_tensor* mrf_sum = nullptr;
         int mrf_count = 0;
         const int mrf_start = i * 3;
