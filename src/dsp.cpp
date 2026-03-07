@@ -21,8 +21,9 @@ DSP::DSP(const DSPConfig& config) : config_(config) {
 }
 
 
-DSP::DSP(DSP&& other) noexcept : config_(other.config_), window_(std::move(other.window_)), fft_cfg_(other.fft_cfg_) {
+DSP::DSP(DSP&& other) noexcept : config_(other.config_), window_(std::move(other.window_)), fft_cfg_(other.fft_cfg_), fft_fwd_cfg_(other.fft_fwd_cfg_) {
     other.fft_cfg_ = nullptr;
+    other.fft_fwd_cfg_ = nullptr;
 }
 
 DSP& DSP::operator=(DSP&& other) noexcept {
@@ -32,8 +33,10 @@ DSP& DSP::operator=(DSP&& other) noexcept {
         config_ = other.config_;
         window_ = std::move(other.window_);
         fft_cfg_ = other.fft_cfg_;
+        fft_fwd_cfg_ = other.fft_fwd_cfg_;
         
         other.fft_cfg_ = nullptr;
+        other.fft_fwd_cfg_ = nullptr;
     }
     return *this;
 }
@@ -47,10 +50,16 @@ void DSP::init_fft() {
     if (verbose) std::cerr << "DEBUG DSP: init_fft called for n_fft=" << config_.n_fft << "\n";
     // Initialize inverse FFT configuration
     fft_cfg_ = kiss_fft_alloc(config_.n_fft, 1, nullptr, nullptr);  // 1 = inverse
+    // Initialize forward FFT configuration
+    fft_fwd_cfg_ = kiss_fft_alloc(config_.n_fft, 0, nullptr, nullptr);  // 0 = forward
     if (!fft_cfg_) {
-        if (verbose) std::cerr << "DEBUG DSP: Failed to allocate kiss_fft_cfg!\n";
-    } else {
-        if (verbose) std::cerr << "DEBUG DSP: kiss_fft_cfg allocated at " << fft_cfg_ << "\n";
+        if (verbose) std::cerr << "DEBUG DSP: Failed to allocate inverse kiss_fft_cfg!\n";
+    }
+    if (!fft_fwd_cfg_) {
+        if (verbose) std::cerr << "DEBUG DSP: Failed to allocate forward kiss_fft_cfg!\n";
+    }
+    if (verbose && fft_cfg_ && fft_fwd_cfg_) {
+        std::cerr << "DEBUG DSP: kiss_fft_cfg allocated (inv=" << fft_cfg_ << ", fwd=" << fft_fwd_cfg_ << ")\n";
     }
 }
 
@@ -58,6 +67,10 @@ void DSP::cleanup_fft() {
     if (fft_cfg_) {
         kiss_fft_free(fft_cfg_);
         fft_cfg_ = nullptr;
+    }
+    if (fft_fwd_cfg_) {
+        kiss_fft_free(fft_fwd_cfg_);
+        fft_fwd_cfg_ = nullptr;
     }
 }
 
@@ -99,6 +112,77 @@ void DSP::ifft(const std::complex<float>* in, std::complex<float>* out, int n) {
     for (int i = 0; i < n; i++) {
         out[i] = std::complex<float>(kout[i].r * scale, kout[i].i * scale);
     }
+}
+
+void DSP::fft(const std::complex<float>* in, std::complex<float>* out, int n) {
+    if (!fft_fwd_cfg_) {
+        if (std::getenv("HEARTBEAT_VERBOSE") != nullptr) {
+            std::cerr << "DEBUG DSP: fft called with null forward cfg!\n";
+        }
+        return;
+    }
+    auto cfg = static_cast<kiss_fft_cfg>(fft_fwd_cfg_);
+    std::vector<kiss_fft_cpx> kin(n), kout(n);
+    for (int i = 0; i < n; i++) {
+        kin[i].r = in[i].real();
+        kin[i].i = in[i].imag();
+    }
+    kiss_fft(cfg, kin.data(), kout.data());
+    for (int i = 0; i < n; i++) {
+        out[i] = std::complex<float>(kout[i].r, kout[i].i);
+    }
+}
+
+int DSP::stft(const std::vector<float>& signal,
+              std::vector<float>& out_magnitude,
+              std::vector<float>& out_phase,
+              int& out_n_frames) {
+    const int n_fft = config_.n_fft;
+    const int hop = config_.hop_length;
+    const int half_bins = n_fft / 2 + 1;
+
+    if (window_.empty()) {
+        window_ = hanning_window(n_fft);
+    }
+
+    // center=True: pad signal by n_fft/2 on each side (matching torch.stft default)
+    const int pad = n_fft / 2;
+    std::vector<float> padded(signal.size() + 2 * pad, 0.0f);
+    std::memcpy(padded.data() + pad, signal.data(), signal.size() * sizeof(float));
+    // Reflect padding (matching PyTorch reflect mode)
+    for (int i = 0; i < pad && i < (int)signal.size(); i++) {
+        padded[pad - 1 - i] = signal[i + 1 < (int)signal.size() ? i + 1 : 0];
+        padded[pad + signal.size() + i] = signal[signal.size() > 1 ? signal.size() - 2 - i : 0];
+    }
+
+    const int padded_len = static_cast<int>(padded.size());
+    out_n_frames = (padded_len - n_fft) / hop + 1;
+    if (out_n_frames <= 0) {
+        out_magnitude.clear();
+        out_phase.clear();
+        return half_bins;
+    }
+
+    out_magnitude.resize(out_n_frames * half_bins);
+    out_phase.resize(out_n_frames * half_bins);
+
+    std::vector<std::complex<float>> fft_in(n_fft);
+    std::vector<std::complex<float>> fft_out(n_fft);
+
+    for (int t = 0; t < out_n_frames; t++) {
+        const int offset = t * hop;
+        for (int k = 0; k < n_fft; k++) {
+            fft_in[k] = std::complex<float>(padded[offset + k] * window_[k], 0.0f);
+        }
+        fft(fft_in.data(), fft_out.data(), n_fft);
+        for (int f = 0; f < half_bins; f++) {
+            const int idx = t * half_bins + f;
+            out_magnitude[idx] = std::abs(fft_out[f]);
+            out_phase[idx] = std::arg(fft_out[f]);
+        }
+    }
+
+    return half_bins;
 }
 
 std::vector<float> DSP::istft(const std::vector<float>& magnitude,
