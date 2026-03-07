@@ -296,7 +296,10 @@ private:
                                ggml_tensor* asr,
                                ggml_tensor* f0_curve,
                                ggml_tensor* n_curve,
-                               ggml_tensor* style);
+                               ggml_tensor* style,
+                               const float* har_data = nullptr,
+                               int har_time = 0,
+                               int har_channels = 0);
     
     // Reference to loader for tensor access
     GGUFLoader* loader_ = nullptr;
