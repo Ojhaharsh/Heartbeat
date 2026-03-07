@@ -275,10 +275,9 @@ std::vector<int> Phonemizer::text_to_tokens(const std::string& text,
         return tokens;
     }
     
-    // Add BOS token
-    if (bos_token_id_ >= 0) {
-        tokens.push_back(bos_token_id_);
-    }
+    // Add BOS token (Kokoro uses token 0 as BOS/EOS, not a named special token)
+    // Reference: input_ids = torch.LongTensor([[0, *input_ids, 0]])
+    tokens.push_back(0);
     
     // Convert to IPA
     std::string ipa = text_to_ipa(normalized, config.language);
@@ -293,10 +292,8 @@ std::vector<int> Phonemizer::text_to_tokens(const std::string& text,
         }
     }
     
-    // Add EOS token
-    if (eos_token_id_ >= 0) {
-        tokens.push_back(eos_token_id_);
-    }
+    // Add EOS token (always 0 for Kokoro)
+    tokens.push_back(0);
     
     return tokens;
 }
@@ -305,6 +302,7 @@ int Phonemizer::get_token_id(const std::string& phoneme) const {
     auto it = vocab_map_.find(phoneme);
     return (it != vocab_map_.end()) ? it->second : unk_token_id_;
 }
+
 
 std::vector<std::string> Phonemizer::available_languages() const {
     std::vector<std::string> languages;
