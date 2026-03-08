@@ -45,8 +45,8 @@ public:
      * @return Number of frequency bins per frame (n_fft/2 + 1).
      */
     int stft(const std::vector<float>& signal,
-             std::vector<float>& out_magnitude,
-             std::vector<float>& out_phase,
+             std::vector<float>& out_real,
+             std::vector<float>& out_imag,
              int& out_n_frames);
 
     /**
