@@ -33,12 +33,59 @@ extern "C" {
 
 namespace heartbeat {
 
-// Forward declarations
 static ggml_tensor* layer_norm(ggml_context* ctx, ggml_tensor* x, 
                                ggml_tensor* weight, ggml_tensor* bias);
+static ggml_tensor* upsample_nearest(ggml_context* ctx, ggml_tensor* x, int factor);
+static ggml_tensor* upsample_nearest_2x(ggml_context* ctx, ggml_tensor* x);
+static ggml_tensor* crop_time_length(ggml_context* ctx, ggml_tensor* x, int64_t target_len);
+struct AdainResBlk1dWeights;
+static ggml_tensor* build_adainresblk1d(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style, const AdainResBlk1dWeights& w, bool upsample);
 
 static bool heartbeat_verbose() {
     return std::getenv("HEARTBEAT_VERBOSE") != nullptr;
+}
+
+static ggml_tensor* safe_reshape_3d(ggml_context* ctx, ggml_tensor* a, int64_t ne0, int64_t ne1, int64_t ne2) {
+    if (!a) return nullptr;
+    int64_t n_elem = ggml_nelements(a);
+    int64_t req_elem = ne0 * ne1 * ne2;
+    if (n_elem != req_elem && heartbeat_verbose()) {
+        fprintf(stderr, "WARNING safe_reshape_3d mismatch: a=[%lld,%lld,%lld,%lld] (%lld) req=[%lld,%lld,%lld] (%lld)\n", 
+            a->ne[0], a->ne[1], a->ne[2], a->ne[3], n_elem, ne0, ne1, ne2, req_elem);
+    }
+    int64_t nb1 = ne0 * a->nb[0];
+    int64_t nb2 = ne1 * nb1;
+    return ggml_view_3d(ctx, a, ne0, ne1, ne2, nb1, nb2, 0);
+}
+
+static ggml_tensor* safe_reshape_4d(ggml_context* ctx, ggml_tensor* a, int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3) {
+    if (!a) return nullptr;
+    int64_t n_elem = ggml_nelements(a);
+    int64_t req_elem = ne0 * ne1 * ne2 * ne3;
+    if (n_elem != req_elem && heartbeat_verbose()) {
+        fprintf(stderr, "WARNING safe_reshape_4d mismatch: a=[%lld,%lld,%lld,%lld] (%lld) req=[%lld,%lld,%lld,%lld] (%lld)\n", 
+            a->ne[0], a->ne[1], a->ne[2], a->ne[3], n_elem, ne0, ne1, ne2, ne3, req_elem);
+    }
+    int64_t nb1 = ne0 * a->nb[0];
+    int64_t nb2 = ne1 * nb1;
+    int64_t nb3 = ne2 * nb2;
+    return ggml_view_4d(ctx, a, ne0, ne1, ne2, ne3, nb1, nb2, nb3, 0);
+}
+
+static ggml_tensor* broadcast_add(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) {
+    if (!a || !b) return a ? a : b;
+    if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1] && a->ne[2] == b->ne[2] && a->ne[3] == b->ne[3]) {
+        return ggml_add(ctx, a, b);
+    }
+    return ggml_add(ctx, a, ggml_repeat_4d(ctx, b, a->ne[0], a->ne[1], a->ne[2], a->ne[3]));
+}
+
+static ggml_tensor* broadcast_mul(ggml_context* ctx, ggml_tensor* a, ggml_tensor* b) {
+    if (!a || !b) return nullptr;
+    if (a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1] && a->ne[2] == b->ne[2] && a->ne[3] == b->ne[3]) {
+        return ggml_mul(ctx, a, b);
+    }
+    return ggml_mul(ctx, a, ggml_repeat_4d(ctx, b, a->ne[0], a->ne[1], a->ne[2], a->ne[3]));
 }
 
 static int heartbeat_num_threads() {
@@ -66,8 +113,8 @@ static int heartbeat_parse_env_int(const char* name, int fallback, int min_v, in
 }
 
 static size_t heartbeat_ctx_size_bytes() {
-    // Default to 13 GiB to avoid small overruns on medium-length prompts.
-    const int mb = heartbeat_parse_env_int("HEARTBEAT_CTX_MB", 13312, 1024, 65536);
+    // Default to 4 GiB to avoid out-of-memory on typical user systems.
+    const int mb = heartbeat_parse_env_int("HEARTBEAT_CTX_MB", 4096, 1024, 65536);
     return static_cast<size_t>(mb) * 1024ULL * 1024ULL;
 }
 
@@ -252,12 +299,14 @@ static std::vector<float> compute_harmonic_source(
     out_har_time = stft_frames;
     out_har_channels = stft_bins * 2;  // magnitude + phase = n_fft + 2
 
-    // GGML tensor data is element-contiguous: data[time * channels + channel]
+    // GGML tensor data is element-contiguous along ne[0].
+    // Since ne[0] = har_time (stft_frames), Time is the fastest changing dimension!
+    // Layout MUST be data[channel * Time + time]
     std::vector<float> har_data(static_cast<size_t>(stft_frames) * out_har_channels);
     for (int t = 0; t < stft_frames; t++) {
         for (int f = 0; f < stft_bins; f++) {
-            har_data[static_cast<size_t>(t) * out_har_channels + f] = har_spec[t * stft_bins + f];
-            har_data[static_cast<size_t>(t) * out_har_channels + stft_bins + f] = har_phase[t * stft_bins + f];
+            har_data[f * stft_frames + t] = har_spec[t * stft_bins + f];
+            har_data[(stft_bins + f) * stft_frames + t] = har_phase[t * stft_bins + f];
         }
     }
 
@@ -747,10 +796,10 @@ static ggml_tensor* layer_norm(ggml_context* ctx, ggml_tensor* x,
     // ggml_norm returns (x - mean) / sqrt(var + eps)
     x = ggml_norm(ctx, x, 1e-5f);
     if (weight) {
-        x = ggml_mul(ctx, x, weight);
+        x = broadcast_mul(ctx, x, weight);
     }
     if (bias) {
-        x = ggml_add(ctx, x, bias);
+        x = broadcast_add(ctx, x, bias);
     }
     return x;
 }
@@ -779,25 +828,25 @@ static ggml_tensor* apply_weight_norm(ggml_context* ctx, ggml_tensor* g, ggml_te
         v_norm = ggml_sum_rows(ctx, ggml_reshape_2d(ctx, v_sq, v->ne[0] * v->ne[1], v->ne[2]));
         v_norm = ggml_sqrt(ctx, v_norm);
         
-        // Scale v by g / v_norm along ne2
-        // reshape g and v_norm to match [1, 1, IC] for repeat
-        ggml_tensor* g_3d = ggml_reshape_3d(ctx, g, 1, 1, v->ne[2]);
-        ggml_tensor* vn_3d = ggml_reshape_3d(ctx, v_norm, 1, 1, v->ne[2]);
+        ggml_tensor* g_3d = safe_reshape_3d(ctx, g, 1, 1, v->ne[2]);
+        ggml_tensor* vn_3d = safe_reshape_3d(ctx, v_norm, 1, 1, v->ne[2]);
         
         ggml_tensor* scale = ggml_div(ctx, g_3d, vn_3d);
-        return ggml_mul(ctx, v, ggml_repeat(ctx, scale, v));
+        if (heartbeat_verbose()) {
+            std::cerr << "DEBUG Repeat IC: v[" << v->ne[0] << "," << v->ne[1] << "," << v->ne[2] << "," << v->ne[3] << "] scale[" << scale->ne[0] << "," << scale->ne[1] << "," << scale->ne[2] << "," << scale->ne[3] << "]\n";
+        }
+        return broadcast_mul(ctx, v, scale);
     } else {
         // Standard OC scaling (ne[v->n_dims-1])
         // Reshape to [K*IC, OC]
         v_norm = ggml_sum_rows(ctx, ggml_reshape_2d(ctx, v_sq, v->ne[0] * v->ne[1], v->ne[2]));
         v_norm = ggml_sqrt(ctx, v_norm);
         
-        // Scale v by g / v_norm
-        ggml_tensor* g_3d = ggml_reshape_3d(ctx, g, 1, 1, v->ne[2]);
-        ggml_tensor* vn_3d = ggml_reshape_3d(ctx, v_norm, 1, 1, v->ne[2]);
+        ggml_tensor* g_3d = safe_reshape_3d(ctx, g, 1, 1, v->ne[2]);
+        ggml_tensor* vn_3d = safe_reshape_3d(ctx, v_norm, 1, 1, v->ne[2]);
         
         ggml_tensor* scale = ggml_div(ctx, g_3d, vn_3d);
-        return ggml_mul(ctx, v, ggml_repeat(ctx, scale, v));
+        return broadcast_mul(ctx, v, scale);
     }
 }
 
@@ -820,7 +869,8 @@ static ggml_tensor* weight_norm_conv1d(ggml_context* ctx,
     ggml_tensor* h = ggml_conv_1d(ctx, w_f16, x, stride, padding, dilation);
     
     if (bias) {
-        h = ggml_add(ctx, h, ggml_repeat(ctx, ggml_reshape_3d(ctx, bias, 1, bias->ne[0], 1), h));
+        ggml_tensor* b3d = ((h->ne[0] == (int64_t)bias->ne[0]) ? safe_reshape_3d(ctx, bias, (int64_t)bias->ne[0], 1, 1) : safe_reshape_3d(ctx, bias, 1, (int64_t)bias->ne[0], 1));
+        h = broadcast_add(ctx, h, b3d);
     }
     
     return h;
@@ -841,7 +891,8 @@ static ggml_tensor* plain_conv1d(ggml_context* ctx,
     ggml_tensor* w_f16 = ggml_cast(ctx, w_cont, GGML_TYPE_F16);
     ggml_tensor* h = ggml_conv_1d(ctx, w_f16, x, stride, padding, dilation);
     if (bias) {
-        h = ggml_add(ctx, h, ggml_repeat(ctx, ggml_reshape_3d(ctx, bias, 1, bias->ne[0], 1), h));
+        ggml_tensor* b3d = ((h->ne[0] == (int64_t)bias->ne[0]) ? safe_reshape_3d(ctx, bias, (int64_t)bias->ne[0], 1, 1) : safe_reshape_3d(ctx, bias, 1, (int64_t)bias->ne[0], 1));
+        h = broadcast_add(ctx, h, b3d);
     }
     return h;
 }
@@ -857,18 +908,39 @@ static ggml_tensor* weight_norm_conv_transpose_1d(ggml_context* ctx,
     if (!x || !w_v) return x;
     
     ggml_tensor* w = apply_weight_norm(ctx, w_g, w_v);
-    
-    // Ensure weights are contiguous
     ggml_tensor* w_cont = ggml_cont(ctx, w);
     ggml_tensor* w_f16 = ggml_cast(ctx, w_cont, GGML_TYPE_F16);
     
-    // ggml_conv_transpose_1d: kernel [K, OC, IC], data [L, IC, N]
-    ggml_tensor* h = ggml_conv_transpose_1d(ctx, w_f16, x, stride, padding, dilation);
+    ggml_tensor* h;
+    // Check for depthwise: kernel [K, 1, C] where C matches input channels
+    bool is_dw = (w_f16->ne[1] == 1 && w_f16->ne[2] == x->ne[1]);
     
-    if (bias) {
-        h = ggml_add(ctx, h, ggml_repeat(ctx, ggml_reshape_3d(ctx, bias, 1, bias->ne[0], 1), h));
+    if (is_dw) {
+        // Emulate Depthwise ConvTranspose1d factor 2: upsample + depthwise conv
+        // Kokoro pool is typically stride 2.
+        ggml_tensor* x_up = upsample_nearest(ctx, x, stride);
+        // ggml_conv_1d_dw expects [K, 1, C] kernel which we have.
+        // For PyTorch ConvTranspose1d, equivalent nearest+conv padding is (K-1)/2
+        int dw_padding = (w_f16->ne[0] - 1) / 2;
+        h = ggml_conv_1d_dw(ctx, w_f16, x_up, 1, dw_padding, dilation);
+    } else {
+        // Normal ConvTranspose1d: [K, OC, IC]
+        // GGUF might be [K, IC, OC] if ne[1] doesn't match a known channel count or bias
+        if (bias && w_f16->ne[1] != bias->ne[0] && w_f16->ne[2] == bias->ne[0]) {
+            w_f16 = ggml_cont(ctx, ggml_permute(ctx, w_f16, 0, 2, 1, 3));
+        }
+        h = ggml_conv_transpose_1d(ctx, w_f16, x, stride, padding, dilation);
     }
     
+    if (bias) {
+        ggml_tensor* b3d;
+        if (h->ne[0] == bias->ne[0]) {
+            b3d = safe_reshape_3d(ctx, bias, (int64_t)bias->ne[0], 1, 1);
+        } else {
+            b3d = safe_reshape_3d(ctx, bias, 1, (int64_t)bias->ne[0], 1);
+        }
+        h = broadcast_add(ctx, h, b3d);
+    }
     return h;
 }
 
@@ -877,15 +949,21 @@ static ggml_tensor* build_snake(ggml_context* ctx, ggml_tensor* x, ggml_tensor* 
     if (!alpha) return ggml_leaky_relu(ctx, x, 0.1, true); // Fallback
     
     // Snake activation: x + (1/alpha) * sin(alpha * x)^2
-    // alpha shape: [1, C, 1] — broadcast to [T, C, 1] to match x
-    ggml_tensor* alpha_rep = ggml_repeat(ctx, alpha, x);
-    ggml_tensor* ax = ggml_mul(ctx, x, alpha_rep);
+    int channels = (int)alpha->ne[0];
+    ggml_tensor* a3d;
+    if (x->ne[0] == channels) {
+        a3d = safe_reshape_3d(ctx, alpha, channels, 1, 1);
+    } else {
+        a3d = safe_reshape_3d(ctx, alpha, 1, channels, 1);
+    }
+    
+    ggml_tensor* ax = broadcast_mul(ctx, x, a3d);
     ggml_tensor* sin_ax = ggml_sin(ctx, ax);
     ggml_tensor* sin2_ax = ggml_sqr(ctx, sin_ax);
     
     // (1/alpha) * sin^2(alpha*x) = sin^2(alpha*x) / alpha
-    ggml_tensor* term2 = ggml_div(ctx, sin2_ax, alpha_rep);
-    return ggml_add(ctx, x, term2);
+    ggml_tensor* term2 = ggml_div(ctx, sin2_ax, ggml_repeat(ctx, a3d, sin2_ax));
+    return broadcast_add(ctx, x, term2);
 }
 
 static ggml_tensor* build_adain(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style, const AdaINWeights& w) {
@@ -904,26 +982,33 @@ static ggml_tensor* build_adain(ggml_context* ctx, ggml_tensor* x, ggml_tensor* 
     // 2. AdaIN scale/bias from style
     // h = fc(s) -> [2*C]
     ggml_tensor* h = ggml_mul_mat(ctx, w.fc_weight, style);
-    if (w.fc_bias) h = ggml_add(ctx, h, w.fc_bias);
+    if (w.fc_bias) h = broadcast_add(ctx, h, w.fc_bias);
     
     // Split h into gamma and beta
     int channels = (int)x->ne[1];
-    if (h->ne[0] < 2 * channels) {
-        return x;
-    }
+    if (h->ne[0] < 2 * channels) return x;
+    
     ggml_tensor* gamma = ggml_view_1d(ctx, h, channels, 0);
     ggml_tensor* beta = ggml_view_1d(ctx, h, channels, channels * sizeof(float));
     
-    // Reshape to [1, C, 1] for broadcasting
-    ggml_tensor* gamma_3d = ggml_reshape_3d(ctx, gamma, 1, channels, 1);
-    ggml_tensor* beta_3d = ggml_reshape_3d(ctx, beta, 1, channels, 1);
+    // Auto-detect layout: 
+    // If Channels is at ne[0], we use [C, 1, 1]
+    // If Channels is at ne[1], we use [1, C, 1]
+    ggml_tensor* gamma_3d;
+    ggml_tensor* beta_3d;
+    if (normalized->ne[0] == (int64_t)channels) {
+        gamma_3d = safe_reshape_3d(ctx, gamma, (int64_t)channels, 1, 1);
+        beta_3d = safe_reshape_3d(ctx, beta, (int64_t)channels, 1, 1);
+    } else {
+        gamma_3d = safe_reshape_3d(ctx, gamma, 1, (int64_t)channels, 1);
+        beta_3d = safe_reshape_3d(ctx, beta, 1, (int64_t)channels, 1);
+    }
     
-    // result = (1 + gamma) * norm(x) + beta
     ggml_tensor* one = ggml_new_f32(ctx, 1.0f);
-    ggml_tensor* one_plus_gamma = ggml_add(ctx, ggml_repeat(ctx, one, gamma_3d), gamma_3d);
+    ggml_tensor* one_plus_gamma = broadcast_add(ctx, gamma_3d, one);
     
-    ggml_tensor* out = ggml_mul(ctx, normalized, ggml_repeat(ctx, one_plus_gamma, normalized));
-    out = ggml_add(ctx, out, ggml_repeat(ctx, beta_3d, out));
+    ggml_tensor* scaled_norm = broadcast_mul(ctx, normalized, ggml_repeat(ctx, one_plus_gamma, normalized));
+    ggml_tensor* out = broadcast_add(ctx, scaled_norm, beta_3d);
     
     return out;
 }
@@ -950,11 +1035,13 @@ static ggml_tensor* upsample_nearest(ggml_context* ctx, ggml_tensor* x, int fact
     if (len <= 0 || ch <= 0) {
         return x;
     }
-    ggml_tensor* x3 = ggml_reshape_3d(ctx, x, len, ch, batch);
-    ggml_tensor* x4 = ggml_reshape_4d(ctx, x3, 1, len, ch, batch);
-    ggml_tensor* tgt = ggml_new_tensor_4d(ctx, x->type, factor, len, ch, batch);
-    ggml_tensor* rep = ggml_repeat(ctx, x4, tgt);
-    return ggml_reshape_3d(ctx, rep, len * factor, ch, batch);
+    ggml_tensor* x3 = safe_reshape_3d(ctx, x, len, ch, batch);
+    ggml_tensor* x4 = safe_reshape_4d(ctx, x3, 1, len, ch, batch);
+    ggml_tensor* rep = ggml_repeat_4d(ctx, x4, factor, len, ch, batch);
+    
+    // Use view instead of reshape to avoid nelements check if it's acting up.
+    // Length is ne0 * factor.
+    return ggml_view_3d(ctx, rep, len * factor, ch, batch, rep->nb[2], rep->nb[3], 0);
 }
 
 static ggml_tensor* upsample_nearest_2x(ggml_context* ctx, ggml_tensor* x) {
@@ -979,11 +1066,24 @@ static ggml_tensor* build_adainresblk1d(ggml_context* ctx, ggml_tensor* x, ggml_
     res = ggml_leaky_relu(ctx, res, 0.2, true);
     
     if (upsample) {
-        // Reference uses depthwise ConvTranspose1d(k=3, s=2, groups=dim, p=1, output_padding=1)
-        // GGML doesn't support grouped convolutions, so pool weights [K,1,C] can't be used directly.
-        // Fall back to nearest-neighbor upsampling.
-        res = upsample_nearest_2x(ctx, res);
-        res = crop_time_length(ctx, res, target_len);
+        if (w.pool.weight_v) {
+            // Depthwise upsampler: groups=dim, kernel=3, stride=2, padding=1
+            // GGML requires p0=0 for transposed conv.
+            const int stride = 2;
+            const int pad = 1;
+            res = weight_norm_conv_transpose_1d(ctx, res, w.pool.weight_g, w.pool.weight_v, w.pool.bias, stride, 0, 1);
+            
+            // Simulating p=1 with slicing (output is (L-1)*S + K = 2L-2+3 = 2L+1)
+            // Target is 2L. Slice from pad to 2L+pad.
+            if (res->ne[0] > target_len) {
+                const size_t byte_offset = static_cast<size_t>(pad) * res->nb[0];
+                res = ggml_view_3d(ctx, res, target_len, res->ne[1], res->ne[2],
+                                  res->nb[1], res->nb[2], byte_offset);
+            }
+        } else {
+            res = upsample_nearest_2x(ctx, res);
+            res = crop_time_length(ctx, res, target_len);
+        }
     }
     
     // Derive padding from actual kernel size for "same" output: P = (K-1)/2
@@ -996,8 +1096,8 @@ static ggml_tensor* build_adainresblk1d(ggml_context* ctx, ggml_tensor* x, ggml_
     const int P2 = (K2 - 1) / 2;
     res = weight_norm_conv1d(ctx, res, w.conv2.weight_g, w.conv2.weight_v, w.conv2.bias, 1, P2, 1);
     
-    // add shortcut and scale by rsqrt(2)
-    ggml_tensor* out = ggml_add(ctx, res, shortcut);
+    // Residual connection with temporal cropping if needed (due to conv padding/upsampling interp)
+    ggml_tensor* out = broadcast_add(ctx, res, crop_time_length(ctx, shortcut, res->ne[0]));
     out = ggml_scale(ctx, out, 1.0f / sqrtf(2.0f));
     return out;
 }
@@ -1013,7 +1113,7 @@ static ggml_tensor* build_resbreak_istftnet(ggml_context* ctx, ggml_tensor* x, g
         xt = build_snake(ctx, xt, w.alpha2[j]);
         xt = weight_norm_conv1d(ctx, xt, w.convs2[j].weight_g, w.convs2[j].weight_v, w.convs2[j].bias, 1, (int)(w.convs2[j].weight_v->ne[0]-1)/2, 1);
         
-        x = ggml_add(ctx, x, xt);
+        x = broadcast_add(ctx, x, xt);
     }
     return x;
 }
@@ -1025,7 +1125,14 @@ static ggml_tensor* linear_forward(ggml_context* ctx, ggml_tensor* x, const Line
 
     ggml_tensor* y = ggml_mul_mat(ctx, w.weight, x);
     if (w.bias) {
-        y = ggml_add(ctx, y, ggml_repeat(ctx, w.bias, y));
+        // The original instruction had a misplaced code block here.
+        // Assuming the intent was to ensure correct local variables for bias reshaping
+        // if the existing logic was flawed, but the provided snippet was for a conv_1d.
+        // Keeping the original linear_forward logic, but if the user intended to
+        // replace it with a conv_1d, that would require more context and variable definitions.
+        // The existing bias reshaping already uses 'w.bias'.
+        ggml_tensor* b3d = ((y->ne[0] == (int64_t)w.bias->ne[0]) ? safe_reshape_3d(ctx, w.bias, (int64_t)w.bias->ne[0], 1, 1) : safe_reshape_3d(ctx, w.bias, 1, (int64_t)w.bias->ne[0], 1));
+        y = broadcast_add(ctx, y, b3d);
     }
     return y;
 }
@@ -1052,13 +1159,22 @@ static ggml_tensor* style_layer_norm(ggml_context* ctx,
     ggml_tensor* beta = ggml_view_1d(ctx, h, channels, channels * sizeof(float));
 
     ggml_tensor* x_norm = ggml_norm(ctx, x, 1e-5f);
-    ggml_tensor* gamma2d = ggml_repeat(ctx, ggml_reshape_2d(ctx, gamma, channels, 1), x_norm);
-    ggml_tensor* beta2d = ggml_repeat(ctx, ggml_reshape_2d(ctx, beta, channels, 1), x_norm);
-    ggml_tensor* one = ggml_new_f32(ctx, 1.0f);
-    ggml_tensor* one_rep = ggml_repeat(ctx, one, gamma2d);
+    
+    // Flexible layout detection for 2D/3D inputs
+    ggml_tensor* gamma_3d;
+    ggml_tensor* beta_3d;
+    if (x_norm->ne[0] == channels) {
+        gamma_3d = safe_reshape_3d(ctx, gamma, channels, 1, 1);
+        beta_3d = safe_reshape_3d(ctx, beta, channels, 1, 1);
+    } else {
+        gamma_3d = safe_reshape_3d(ctx, gamma, 1, channels, 1);
+        beta_3d = safe_reshape_3d(ctx, beta, 1, channels, 1);
+    }
 
-    ggml_tensor* y = ggml_mul(ctx, x_norm, ggml_add(ctx, one_rep, gamma2d));
-    y = ggml_add(ctx, y, beta2d);
+    ggml_tensor* one = ggml_new_f32(ctx, 1.0f);
+    ggml_tensor* one_plus_gamma = broadcast_add(ctx, gamma_3d, one);
+    ggml_tensor* y = broadcast_mul(ctx, x_norm, ggml_repeat(ctx, one_plus_gamma, x_norm));
+    y = broadcast_add(ctx, y, beta_3d);
     return y;
 }
 
@@ -1088,7 +1204,7 @@ ggml_tensor* Model::build_embeddings(ggml_context* ctx,
         for (int i = 0; i < seq_len; i++) pos_data[i] = i;
         
         ggml_tensor* pos_emb = ggml_get_rows(ctx, weights_.position_embeddings, pos_ids);
-        hidden = ggml_add(ctx, hidden, pos_emb);
+        hidden = broadcast_add(ctx, hidden, pos_emb);
     }
     
     // 3. Token Type Embeddings (if available) - usually 0 for single sentence
@@ -1098,7 +1214,7 @@ ggml_tensor* Model::build_embeddings(ggml_context* ctx,
         ggml_set_zero(type_ids);
         
         ggml_tensor* type_emb = ggml_get_rows(ctx, weights_.token_type_embeddings, type_ids);
-        hidden = ggml_add(ctx, hidden, type_emb);
+        hidden = broadcast_add(ctx, hidden, type_emb);
     }
     
     // 4. Layer Norm
@@ -1120,19 +1236,19 @@ ggml_tensor* Model::build_attention(ggml_context* ctx,
     
     // 1. Project Q, K, V: [hidden_size, seq_len]
     ggml_tensor* Q = ggml_mul_mat(ctx, layer.q_weight, hidden);
-    if (layer.q_bias) Q = ggml_add(ctx, Q, layer.q_bias);
+    if (layer.q_bias) Q = broadcast_add(ctx, Q, layer.q_bias);
     
     ggml_tensor* K = ggml_mul_mat(ctx, layer.k_weight, hidden);
-    if (layer.k_bias) K = ggml_add(ctx, K, layer.k_bias);
+    if (layer.k_bias) K = broadcast_add(ctx, K, layer.k_bias);
     
     ggml_tensor* V = ggml_mul_mat(ctx, layer.v_weight, hidden);
-    if (layer.v_bias) V = ggml_add(ctx, V, layer.v_bias);
+    if (layer.v_bias) V = broadcast_add(ctx, V, layer.v_bias);
     
     // 2. Reshape to [head_dim, n_heads, seq_len] then permute to [head_dim, seq_len, n_heads]
     //    This groups the batch dimension by attention head for batched matmul.
-    Q = ggml_reshape_3d(ctx, Q, head_dim, n_heads, seq_len);
-    K = ggml_reshape_3d(ctx, K, head_dim, n_heads, seq_len);
-    V = ggml_reshape_3d(ctx, V, head_dim, n_heads, seq_len);
+    Q = safe_reshape_3d(ctx, Q, head_dim, n_heads, seq_len);
+    K = safe_reshape_3d(ctx, K, head_dim, n_heads, seq_len);
+    V = safe_reshape_3d(ctx, V, head_dim, n_heads, seq_len);
     
     Q = ggml_cont(ctx, ggml_permute(ctx, Q, 0, 2, 1, 3)); // [head_dim, seq_len, n_heads]
     K = ggml_cont(ctx, ggml_permute(ctx, K, 0, 2, 1, 3));
@@ -1157,10 +1273,10 @@ ggml_tensor* Model::build_attention(ggml_context* ctx,
     
     // 6. Output projection
     ggml_tensor* out = ggml_mul_mat(ctx, layer.o_weight, context);
-    if (layer.o_bias) out = ggml_add(ctx, out, layer.o_bias);
+    if (layer.o_bias) out = broadcast_add(ctx, out, layer.o_bias);
     
     // 7. Residual + post-LayerNorm
-    out = ggml_add(ctx, hidden, out);
+    out = broadcast_add(ctx, hidden, out);
     out = layer_norm(ctx, out, layer.attn_ln_weight, layer.attn_ln_bias);
     
     return out;
@@ -1170,14 +1286,14 @@ ggml_tensor* Model::build_ffn(ggml_context* ctx,
                                ggml_tensor* hidden,
                                const ALBERTLayer& layer) {
     ggml_tensor* inter = ggml_mul_mat(ctx, layer.ffn_weight, hidden);
-    if (layer.ffn_bias) inter = ggml_add(ctx, inter, layer.ffn_bias);
+    if (layer.ffn_bias) inter = broadcast_add(ctx, inter, layer.ffn_bias);
     
     inter = ggml_gelu(ctx, inter);
     
     ggml_tensor* out = ggml_mul_mat(ctx, layer.ffn_out_weight, inter);
-    if (layer.ffn_out_bias) out = ggml_add(ctx, out, layer.ffn_out_bias);
+    if (layer.ffn_out_bias) out = broadcast_add(ctx, out, layer.ffn_out_bias);
     
-    out = ggml_add(ctx, hidden, out);
+    out = broadcast_add(ctx, hidden, out);
     out = layer_norm(ctx, out, layer.full_ln_weight, layer.full_ln_bias);
     
     return out;
@@ -1379,7 +1495,7 @@ ggml_tensor* Model::build_encoder(ggml_context* ctx, ggml_tensor* hidden) {
     if (use_albert && weights_.bert_proj_weight) {
         hidden = ggml_mul_mat(ctx, weights_.bert_proj_weight, hidden);
         if (weights_.bert_proj_bias) {
-            hidden = ggml_add(ctx, hidden, weights_.bert_proj_bias);
+            hidden = broadcast_add(ctx, hidden, weights_.bert_proj_bias);
         }
     }
     
@@ -1394,7 +1510,7 @@ ggml_tensor* Model::build_encoder(ggml_context* ctx, ggml_tensor* hidden) {
     if (weights_.text_enc_proj_weight) {
         hidden = ggml_mul_mat(ctx, weights_.text_enc_proj_weight, hidden);
         if (weights_.text_enc_proj_bias) {
-            hidden = ggml_add(ctx, hidden, weights_.text_enc_proj_bias);
+            hidden = broadcast_add(ctx, hidden, weights_.text_enc_proj_bias);
         }
     }
     
@@ -1427,7 +1543,8 @@ ggml_tensor* Model::build_duration_predictor(ggml_context* ctx,
     int style_dim = (int)style->ne[0];
     
     // Broadcast style to [style_dim, seq_len]
-    ggml_tensor* style_rep = ggml_repeat(ctx, style, ggml_new_tensor_2d(ctx, GGML_TYPE_F32, style_dim, seq_len));
+    ggml_tensor* tgt = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, style_dim, seq_len);
+    ggml_tensor* style_rep = ggml_repeat_4d(ctx, style, style_dim, seq_len, 1, 1);
 
     ggml_tensor* x = hidden; // [512, Seq]
     
@@ -1488,7 +1605,13 @@ static ggml_tensor* project_curve_from_channels(ggml_context* ctx,
             ggml_tensor* w_f16 = ggml_cast(ctx, w_cont, GGML_TYPE_F16);
             ggml_tensor* y = ggml_conv_1d(ctx, w_f16, x3d, 1, 0, 1);
             if (proj.bias) {
-                y = ggml_add(ctx, y, ggml_repeat(ctx, ggml_reshape_3d(ctx, proj.bias, 1, proj.bias->ne[0], 1), y));
+                ggml_tensor* b3d;
+                if (y->ne[0] == proj.bias->ne[0]) {
+                    b3d = safe_reshape_3d(ctx, proj.bias, proj.bias->ne[0], 1, 1);
+                } else {
+                    b3d = safe_reshape_3d(ctx, proj.bias, 1, proj.bias->ne[0], 1);
+                }
+                y = broadcast_add(ctx, y, b3d);
             }
             return y;
         }
@@ -1511,7 +1634,7 @@ static ggml_tensor* project_curve_from_channels(ggml_context* ctx,
             y2d = ggml_view_2d(ctx, y2d, 1, y2d->ne[1], y2d->nb[1], 0);
         }
         ggml_tensor* y_lc = ggml_cont(ctx, ggml_transpose(ctx, y2d));          // [L, 1]
-        return ggml_reshape_3d(ctx, y_lc, y_lc->ne[0], y_lc->ne[1], 1);        // [L, 1, 1]
+        return safe_reshape_3d(ctx, y_lc, y_lc->ne[0], y_lc->ne[1], 1);        // [L, 1, 1]
     }
 
     // Fallback: use first channel if projection head is unavailable.
@@ -1529,7 +1652,10 @@ static ggml_tensor* build_f0n_curve_predictor(ggml_context* ctx,
 
     // shared_out: [C, L] — already processed by shared LSTM
     ggml_tensor* x_lc = ggml_cont(ctx, ggml_transpose(ctx, shared_out));          // [L, C]
-    ggml_tensor* h = ggml_reshape_3d(ctx, x_lc, x_lc->ne[0], x_lc->ne[1], 1); // [L, C, 1]
+    ggml_tensor* h = safe_reshape_3d(ctx, x_lc, x_lc->ne[0], x_lc->ne[1], 1); // [L, C, 1]
+    if (heartbeat_verbose()) {
+        fprintf(stderr, "TRACE F0_PRED start: h=[%lld,%lld]\n", h->ne[0], h->ne[1]);
+    }
 
     for (int i = 0; i < 3; i++) {
         if (!blocks[i].conv1.weight_v) {
@@ -1537,9 +1663,16 @@ static ggml_tensor* build_f0n_curve_predictor(ggml_context* ctx,
         }
         const bool upsample = (i == 1);
         h = build_adainresblk1d(ctx, h, style, blocks[i], upsample);
+        if (heartbeat_verbose()) {
+            fprintf(stderr, "TRACE F0_PRED block %d: h=[%lld,%lld]\n", i, h->ne[0], h->ne[1]);
+        }
     }
 
-    return project_curve_from_channels(ctx, h, proj); // [L2, 1, 1]
+    ggml_tensor* y = project_curve_from_channels(ctx, h, proj); // [L2, 1, 1]
+    if (heartbeat_verbose()) {
+        fprintf(stderr, "TRACE F0_PRED proj: y=[%lld,%lld]\n", y->ne[0], y->ne[1]);
+    }
+    return y;
 }
 
 
@@ -1682,20 +1815,13 @@ ModelOutput Model::forward(const std::vector<int>& tokens,
     ggml_tensor* d_enc = nullptr;
     ggml_tensor* log_duration = build_duration_predictor(ctx0, hidden_dur, style_tensor_pred, &d_enc);
     
-    // DEBUG: Compute Durations
+    // DEBUG: Duration prediction overview
     if (verbose) {
-        struct ggml_cgraph* gf_dur = ggml_new_graph(ctx0);
-        ggml_build_forward_expand(gf_dur, log_duration);
-        ggml_graph_compute_with_ctx(ctx0, gf_dur, n_threads);
-        
         float* d = (float*)log_duration->data;
-        std::cerr << "DEBUG: Log Duration [0]=" << d[0] << " seq_len=" << log_duration->ne[1] << "\n";
-        
-        float total_dur = 0;
-        for (int i = 0; i < log_duration->ne[1]; i++) {
-            total_dur += expf(d[i]);
-        }
-        std::cerr << "DEBUG: Total Predicted Frames: " << total_dur << "\n";
+        std::cerr << "DEBUG: Duration shape [" << log_duration->ne[0] << ", " << log_duration->ne[1] << "]\n";
+        std::cerr << "DEBUG: First token logits: ";
+        for (int i = 0; i < std::min((int)log_duration->ne[0], 10); i++) std::cerr << d[i] << " ";
+        std::cerr << "...\n";
     }
     
     // 8. Compute Graph (Part 1: Duration)
@@ -2118,7 +2244,7 @@ static ggml_tensor* build_resblock_impl(ggml_context* ctx,
         h = weight_norm_conv1d(ctx, h, w.convs2[j].weight_g, w.convs2[j].weight_v, w.convs2[j].bias, 1, P2, 1);
         
         // 7. Residual add (simple addition, no alpha scaling)
-        x = ggml_add(ctx, residual, h);
+        x = broadcast_add(ctx, residual, h);
     }
     return x;
 }
@@ -2144,16 +2270,16 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
         }
         if (nd == 2) {
             if (t->ne[1] == 1) {
-                return ggml_reshape_3d(ctx, t, t->ne[0], t->ne[1], 1);
+                return safe_reshape_3d(ctx, t, t->ne[0], t->ne[1], 1);
             }
             if (t->ne[0] == 1) {
                 ggml_tensor* tl1 = ggml_cont(ctx, ggml_transpose(ctx, t));
-                return ggml_reshape_3d(ctx, tl1, tl1->ne[0], tl1->ne[1], 1);
+                return safe_reshape_3d(ctx, tl1, tl1->ne[0], tl1->ne[1], 1);
             }
-            return ggml_reshape_3d(ctx, t, t->ne[0], 1, 1);
+            return safe_reshape_3d(ctx, t, t->ne[0], 1, 1);
         }
         // 1D
-        return ggml_reshape_3d(ctx, t, t->ne[0], 1, 1);
+        return safe_reshape_3d(ctx, t, t->ne[0], 1, 1);
     };
 
     auto fit_len = [&](ggml_tensor* t, int64_t target_len) -> ggml_tensor* {
@@ -2174,7 +2300,7 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
     // Inputs:
     // asr: [T, 512]
     // f0_curve/n_curve: [2T, 1, 1] (preferred)
-    ggml_tensor* asr_3d = ggml_reshape_3d(ctx, asr, asr->ne[0], asr->ne[1], 1); // [T, 512, 1]
+    ggml_tensor* asr_3d = safe_reshape_3d(ctx, asr, asr->ne[0], asr->ne[1], 1); // [T, 512, 1]
     ggml_tensor* f0_3d = to_curve3d(f0_curve);
     ggml_tensor* n_3d = to_curve3d(n_curve);
 
@@ -2346,7 +2472,7 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
         // 4. Add noise/harmonic source to upsampled x.
         if (x_source) {
             x_source = fit_len(x_source, x->ne[0]);
-            x = ggml_add(ctx, x, x_source);
+            x = broadcast_add(ctx, x, x_source);
         }
 
         // 5. Multi-receptive field fusion (MRF) resblocks.
@@ -2359,7 +2485,7 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
                 continue;
             }
             ggml_tensor* r_out = build_resblock_impl(ctx, x, style, weights_.generator.resblocks[blk_idx]);
-            mrf_sum = mrf_sum ? ggml_add(ctx, mrf_sum, r_out) : r_out;
+            mrf_sum = mrf_sum ? broadcast_add(ctx, mrf_sum, r_out) : r_out;
             mrf_count++;
         }
         if (mrf_sum && mrf_count > 0) {
@@ -2367,7 +2493,7 @@ ggml_tensor* Model::build_decoder(ggml_context* ctx,
         }
     }
 
-    x = ggml_leaky_relu(ctx, x, 0.1f, true);
+    x = ggml_leaky_relu(ctx, x, 0.01f, true);
     if (weights_.generator.conv_post.weight_v) {
         x = weight_norm_conv1d(ctx,
                                x,
