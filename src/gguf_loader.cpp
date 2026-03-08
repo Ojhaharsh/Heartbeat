@@ -329,6 +329,18 @@ void GGUFLoader::extract_params() {
     if (auto* vocab_val = get_metadata("tokenizer.ggml.tokens")) {
         if (auto* tokens = std::get_if<std::vector<std::string>>(vocab_val)) {
             vocab_ = *tokens;
+            
+            // Fix: If the GGUF conversion included the key name and doubled tokens
+            if (vocab_.size() > 200 && vocab_[1] == "tokenizer.ggml.tokens") {
+                std::vector<std::string> clean_vocab;
+                for (size_t i = 6; i < vocab_.size(); i += 2) {
+                    clean_vocab.push_back(vocab_[i]);
+                }
+                vocab_ = clean_vocab;
+            } else if (!vocab_.empty() && vocab_[0] == "tokenizer.ggml.tokens") {
+                vocab_.erase(vocab_.begin());
+            }
+
             for (size_t i = 0; i < vocab_.size(); i++) {
                 vocab_map_[vocab_[i]] = static_cast<int>(i);
             }
