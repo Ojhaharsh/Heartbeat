@@ -134,7 +134,7 @@ void DSP::fft(const std::complex<float>* in, std::complex<float>* out, int n) {
 }
 
 int DSP::stft(const std::vector<float>& signal,
-              std::vector<float>& out_magnitude,
+              std::vector<float>& out_spec,
               std::vector<float>& out_phase,
               int& out_n_frames) {
     const int n_fft = config_.n_fft;
@@ -158,12 +158,12 @@ int DSP::stft(const std::vector<float>& signal,
     const int padded_len = static_cast<int>(padded.size());
     out_n_frames = (padded_len - n_fft) / hop + 1;
     if (out_n_frames <= 0) {
-        out_magnitude.clear();
+        out_spec.clear();
         out_phase.clear();
         return half_bins;
     }
 
-    out_magnitude.resize(out_n_frames * half_bins);
+    out_spec.resize(out_n_frames * half_bins);
     out_phase.resize(out_n_frames * half_bins);
 
     std::vector<std::complex<float>> fft_in(n_fft);
@@ -177,7 +177,7 @@ int DSP::stft(const std::vector<float>& signal,
         fft(fft_in.data(), fft_out.data(), n_fft);
         for (int f = 0; f < half_bins; f++) {
             const int idx = t * half_bins + f;
-            out_magnitude[idx] = std::abs(fft_out[f]);
+            out_spec[idx] = std::abs(fft_out[f]);
             out_phase[idx] = std::arg(fft_out[f]);
         }
     }
@@ -268,6 +268,13 @@ std::vector<float> DSP::istft(const std::vector<std::complex<float>>& spectrogra
         if (window_sum[i] > 1e-8f) {
             audio[i] /= window_sum[i];
         }
+    }
+    
+    // torch.istft with center=True crops n_fft // 2 from both sides of the output
+    int pad = n_fft / 2;
+    if (audio_length > 2 * pad) {
+        std::vector<float> cropped(audio.begin() + pad, audio.end() - pad);
+        return cropped;
     }
     
     return audio;
