@@ -100,6 +100,10 @@ bool Phonemizer::initialize(const std::vector<std::string>& vocab) {
     if (pad_token_id_ < 0) pad_token_id_ = 0;
     if (unk_token_id_ < 0) unk_token_id_ = 0;
     
+    // Kokoro specific: If no explicit BOS/EOS, use space (16) which is a safer neutral start
+    if (bos_token_id_ < 0) bos_token_id_ = 16;
+    if (eos_token_id_ < 0) eos_token_id_ = 16;
+    
     // Try to initialize espeak
     initialized_ = init_espeak();
     
@@ -275,9 +279,8 @@ std::vector<int> Phonemizer::text_to_tokens(const std::string& text,
         return tokens;
     }
     
-    // Add BOS token (Kokoro uses token 0 as BOS/EOS, not a named special token)
-    // Reference: input_ids = torch.LongTensor([[0, *input_ids, 0]])
-    tokens.push_back(0);
+    // Add BOS token
+    tokens.push_back(bos_token_id_);
     
     // Convert to IPA
     std::string ipa = text_to_ipa(normalized, config.language);
@@ -292,8 +295,8 @@ std::vector<int> Phonemizer::text_to_tokens(const std::string& text,
         }
     }
     
-    // Add EOS token (always 0 for Kokoro)
-    tokens.push_back(0);
+    // Add EOS token
+    tokens.push_back(eos_token_id_);
     
     return tokens;
 }
