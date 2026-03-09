@@ -807,47 +807,52 @@ static ggml_tensor* layer_norm(ggml_context* ctx, ggml_tensor* x,
 static ggml_tensor* apply_weight_norm(ggml_context* ctx, ggml_tensor* g, ggml_tensor* v) {
     if (!g || !v) return v;
     
-    // v: [K, OC, IC] for trans-conv, [K, IC, OC] for conv
-    // g: [OC] usually. But for Kokoro's trans-convs, g appears to be [IC].
+    int64_t g_dim = g->ne[0];
+    int64_t v0 = v->ne[0];
+    int64_t v1 = v->ne[1];
+    int64_t v2 = v->ne[2];
     
-    int n_dims = ggml_n_dims(v);
-    int g_dim = (int)g->ne[0];
-    int oc = (int)v->ne[n_dims - 1]; // Last dim is OC for normal conv [K, IC, OC]
-    int ic = (int)v->ne[n_dims - 2]; // Second last is IC
-    
-    // Special case for TransposeConv where weight-norm matches IC (dim 0 in PyTorch)
-    // discovery: ups.0.v=[20, 256, 512], ups.0.g=[512]. So ic=512 matches g.
-    bool scale_ic = (g_dim == v->ne[2] && v->ne[2] != v->ne[1]);
-    
-    ggml_tensor* v_sq = ggml_sqr(ctx, v);
-    ggml_tensor* v_norm;
-    
-    if (scale_ic) {
-        // Norm over [K, OC] to scale each IC
-        // ne0=K, ne1=OC, ne2=IC. Reshape to [K*OC, IC]
-        v_norm = ggml_sum_rows(ctx, ggml_reshape_2d(ctx, v_sq, v->ne[0] * v->ne[1], v->ne[2]));
-        v_norm = ggml_sqrt(ctx, v_norm);
-        
-        ggml_tensor* g_3d = safe_reshape_3d(ctx, g, 1, 1, v->ne[2]);
-        ggml_tensor* vn_3d = safe_reshape_3d(ctx, v_norm, 1, 1, v->ne[2]);
-        
-        ggml_tensor* scale = ggml_div(ctx, g_3d, vn_3d);
+    if (g_dim != v0) {
         if (heartbeat_verbose()) {
-            std::cerr << "DEBUG Repeat IC: v[" << v->ne[0] << "," << v->ne[1] << "," << v->ne[2] << "," << v->ne[3] << "] scale[" << scale->ne[0] << "," << scale->ne[1] << "," << scale->ne[2] << "," << scale->ne[3] << "]\n";
+            fprintf(stderr, "WARNING apply_weight_norm dimension mismatch! g_dim=%lld, v=[%lld,%lld,%lld]. Proceeding without norm.\n", g_dim, v0, v1, v2);
         }
-        return broadcast_mul(ctx, v, scale);
-    } else {
-        // Standard OC scaling (ne[v->n_dims-1])
-        // Reshape to [K*IC, OC]
-        v_norm = ggml_sum_rows(ctx, ggml_reshape_2d(ctx, v_sq, v->ne[0] * v->ne[1], v->ne[2]));
-        v_norm = ggml_sqrt(ctx, v_norm);
-        
-        ggml_tensor* g_3d = safe_reshape_3d(ctx, g, 1, 1, v->ne[2]);
-        ggml_tensor* vn_3d = safe_reshape_3d(ctx, v_norm, 1, 1, v->ne[2]);
-        
-        ggml_tensor* scale = ggml_div(ctx, g_3d, vn_3d);
-        return broadcast_mul(ctx, v, scale);
+        return v; // Fallback to avoid crash during transpose evaluation
     }
+    
+    // In GGUF, weight_g size corresponds to v->ne[0] for all layers 
+    ggml_tensor* v_sq = ggml_sqr(ctx, v);
+    
+    // Reshape to 2D: [v->ne[0], v->ne[1] * v->ne[2]]
+    int64_t ne0 = v->ne[0];
+    int64_t ne1_2 = v->ne[1] * v->ne[2];
+    ggml_tensor* v_sq_2d = ggml_reshape_2d(ctx, v_sq, ne0, ne1_2);
+    
+    // Transpose so that dimension 0 becomes ne1*ne2
+    // ggml_transpose swaps ne0 and ne1
+    ggml_tensor* v_sq_t = ggml_transpose(ctx, v_sq_2d);
+    
+    // Make contiguous for sum_rows
+    ggml_tensor* v_sq_t_cont = ggml_cont(ctx, v_sq_t);
+    
+    // Sum over dimension 0 (ne1*ne2). Output is shape [1, ne0, 1, 1]
+    ggml_tensor* v_norm_t = ggml_sum_rows(ctx, v_sq_t_cont);
+    
+    // Transpose back to shape [ne0, 1, 1, 1]
+    ggml_tensor* v_norm_2d = ggml_transpose(ctx, v_norm_t);
+    ggml_tensor* v_norm_cont = ggml_cont(ctx, v_norm_2d);
+    
+    // Compute sqrt for norm
+    ggml_tensor* v_norm = ggml_sqrt(ctx, v_norm_cont);
+    
+    // g could be [ne0], we safely reshape to [ne0, 1, 1, 1]
+    ggml_tensor* g_3d = safe_reshape_3d(ctx, g, ne0, 1, 1);
+    ggml_tensor* vn_3d = safe_reshape_3d(ctx, v_norm, ne0, 1, 1);
+    
+    // Compute scale = g / v_norm
+    ggml_tensor* scale = ggml_div(ctx, g_3d, vn_3d);
+    
+    // Multiply v by scale over dim 0
+    return broadcast_mul(ctx, v, scale);
 }
 
 static ggml_tensor* weight_norm_conv1d(ggml_context* ctx,
@@ -966,18 +971,33 @@ static ggml_tensor* build_snake(ggml_context* ctx, ggml_tensor* x, ggml_tensor* 
     return broadcast_add(ctx, x, term2);
 }
 
+static ggml_tensor* instance_norm_1d(ggml_context* ctx, ggml_tensor* x, float eps = 1e-5f) {
+    if (!x) return nullptr;
+    int64_t L = x->ne[0];
+    if (L <= 1) return x; 
+
+    // 1. Compute mean over L dimension. ggml_sum_rows results in shape [1, N1, N2, N3]
+    ggml_tensor* sum = ggml_sum_rows(ctx, x);
+    ggml_tensor* mean = ggml_scale(ctx, sum, 1.0f / (float)L);
+    
+    // 2. Broadcast mean to match x
+    ggml_tensor* mean_rep = ggml_repeat_4d(ctx, mean, x->ne[0], x->ne[1], x->ne[2], x->ne[3]);
+    
+    // 3. Center the tensor
+    ggml_tensor* x_centered = ggml_sub(ctx, x, mean_rep);
+    
+    // 4. RMSNorm of a zero-mean tensor equals InstanceNorm
+    return ggml_norm(ctx, x_centered, eps);
+}
+
 static ggml_tensor* build_adain(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style, const AdaINWeights& w) {
     if (!x || !style || !w.fc_weight) return x;
     
     // 1. Instance Norm
     // x is [L, C, N]
-    // ggml_norm does (x-mean)/std globally or per row? 
-    // For InstanceNorm1d, we need mean/std per channel and per batch.
-    // In GGML, x [L, C, N] -> reshape to [L, C*N]? No.
-    // Let's use ggml_norm(ctx, x, 1e-5f) which is usually sufficient if dimensions are aligned.
-    // Actually, we need to be careful. Let's follow StyleTTS2 implementation.
-    
-    ggml_tensor* normalized = ggml_norm(ctx, x, 1e-5f);
+    // ggml_norm computes RMS norm, which does not mean-center.
+    // True InstanceNorm centers the channels by their temporal mean before scaling.
+    ggml_tensor* normalized = instance_norm_1d(ctx, x, 1e-5f);
     
     // 2. AdaIN scale/bias from style
     // h = fc(s) -> [2*C]
