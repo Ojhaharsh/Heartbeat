@@ -314,10 +314,23 @@ std::vector<float> DSP::overlap_add(const std::vector<std::vector<float>>& frame
 std::vector<float> DSP::normalize(const std::vector<float>& audio, float target_peak) {
     if (audio.empty()) return audio;
     
+    // First: Center the signal by subtracting the DC offset (mean)
+    // Neural vocoders can output high DC biases which completely squash the AC peaks.
+    double sum = 0.0;
+    for (float sample : audio) {
+        sum += sample;
+    }
+    float mean = static_cast<float>(sum / audio.size());
+    
+    std::vector<float> ac_audio(audio.size());
+    for (size_t i = 0; i < audio.size(); i++) {
+        ac_audio[i] = audio[i] - mean;
+    }
+    
     // Use a robust peak estimate so isolated spikes don't collapse all speech to ~0.
     std::vector<float> abs_vals;
-    abs_vals.reserve(audio.size());
-    for (float sample : audio) {
+    abs_vals.reserve(ac_audio.size());
+    for (float sample : ac_audio) {
         abs_vals.push_back(std::abs(sample));
     }
 
@@ -334,7 +347,7 @@ std::vector<float> DSP::normalize(const std::vector<float>& audio, float target_
     std::vector<float> result(audio.size());
     
     for (size_t i = 0; i < audio.size(); i++) {
-        result[i] = std::clamp(audio[i] * scale, -1.0f, 1.0f);
+        result[i] = std::clamp(ac_audio[i] * scale, -1.0f, 1.0f);
     }
     
     return result;
