@@ -107,8 +107,8 @@ static int heartbeat_parse_env_int(const char* name, int fallback, int min_v, in
 }
 
 static size_t heartbeat_ctx_size_bytes() {
-    // Default to 4 GiB to avoid out-of-memory on typical user systems.
-    const int mb = heartbeat_parse_env_int("HEARTBEAT_CTX_MB", 4096, 1024, 65536);
+    // Default to 10 GiB for Kokoro/ISTFTNet.
+    const int mb = heartbeat_parse_env_int("HEARTBEAT_CTX_MB", 10240, 1024, 65536);
     return static_cast<size_t>(mb) * 1024ULL * 1024ULL;
 }
 
@@ -604,7 +604,12 @@ bool Model::load_weights(GGUFLoader& loader) {
     weights_.predictor.duration_lstm = get_lstm("predictor.lstm");
     
     // Duration Projection
+    // Some GGUF exports use .linear_layer, others use .fc or direct prefix.
     weights_.predictor.duration_proj = get_linear("predictor.duration_proj");
+    if (!weights_.predictor.duration_proj.weight) {
+        // Many exports use predictor.duration_proj.linear_layer.weight
+        weights_.predictor.duration_proj = get_linear("predictor.duration_proj.linear_layer");
+    }
 
     // F0 Predictor (3 AdainResBlk1d)
     for (int i = 0; i < 3; i++) {
@@ -1079,21 +1084,6 @@ static ggml_tensor* build_adainresblk1d(ggml_context* ctx, ggml_tensor* x, ggml_
     return out;
 }
 
-static ggml_tensor* build_resbreak_istftnet(ggml_context* ctx, ggml_tensor* x, ggml_tensor* style, const ResBlock& w) {
-    // Three stages of (AdaIN -> Snake -> Conv)
-    for (int j = 0; j < 3; j++) {
-        ggml_tensor* xt = build_adain(ctx, x, style, w.adain1[j]);
-        xt = build_snake(ctx, xt, w.alpha1[j]);
-        xt = weight_norm_conv1d(ctx, xt, w.convs1[j].weight_g, w.convs1[j].weight_v, w.convs1[j].bias, 1, (int)(w.convs1[j].weight_v->ne[0]-1)/2, 1); // Auto padding?
-        
-        xt = build_adain(ctx, xt, style, w.adain2[j]);
-        xt = build_snake(ctx, xt, w.alpha2[j]);
-        xt = weight_norm_conv1d(ctx, xt, w.convs2[j].weight_g, w.convs2[j].weight_v, w.convs2[j].bias, 1, (int)(w.convs2[j].weight_v->ne[0]-1)/2, 1);
-        
-        x = broadcast_add(ctx, x, xt);
-    }
-    return x;
-}
 
 static ggml_tensor* linear_forward(ggml_context* ctx, ggml_tensor* x, const LinearWeights& w) {
     if (!x || !w.weight) {
